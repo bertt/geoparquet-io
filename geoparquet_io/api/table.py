@@ -2491,7 +2491,7 @@ class Table:
         query_fraction: float = 0.1,
         num_samples: int = 20,
         seed: int = 42,
-        min_efficiency: float = 0.5,
+        min_efficiency: float = 0.7,
     ) -> CheckResult:
         """
         Check if data is spatially ordered.
@@ -2511,7 +2511,7 @@ class Table:
             num_samples: Number of sample query windows (default: 20).
             seed: Random seed for the sample windows, for reproducibility.
             min_efficiency: Minimum skip rate as a fraction of what this
-                row-group count allows (default: 0.5). 1.0 demands an ideal grid
+                row-group count allows (default: 0.7). 1.0 demands an ideal grid
                 tiling.
 
         Returns:
