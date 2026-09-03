@@ -28,10 +28,10 @@ from geoparquet_io.core.duckdb_utils import (
     quote_identifier,
     validate_compression_level,
 )
+from geoparquet_io.core.geoarrow_encoding import arrow_extension_name
 from geoparquet_io.core.logging_config import configure_verbose, debug, success
 from geoparquet_io.core.write_strategies.base import (
     BaseWriteStrategy,
-    arrow_extension_name,
     build_geo_metadata,
     resolve_geometry_columns,
 )
@@ -181,33 +181,13 @@ def _plain_wkb_for_secondary_columns(table, geometry_column: str, verbose: bool)
     secondaries = resolve_geometry_columns(geometry_column, None, carried_geo) - {geometry_column}
     for column in sorted(secondaries):
         if column in table.column_names:
+            # `_strip_geoarrow_to_plain_wkb` reads the FIELD, so it covers the
+            # metadata-declared carrier too: left in place, DuckDB reads that
+            # marker off `register()` and the COPY writes a native Parquet
+            # GEOMETRY logical type into a 1.0/1.1 file, which is #706
+            # reappearing through the other carrier shape (#727, #792).
             table = _strip_geoarrow_to_plain_wkb(table, column, verbose)
-            table = _drop_metadata_declared_geoarrow(table, column)
     return table
-
-
-def _drop_metadata_declared_geoarrow(table, column: str):
-    """Rewrite a column that declares geoarrow in its FIELD METADATA to plain WKB.
-
-    ``_strip_geoarrow_to_plain_wkb`` keys off the resolved Arrow extension type
-    alone, so it leaves this shape untouched -- but DuckDB reads the marker off
-    the field metadata and registers the column as GEOMETRY anyway, and the COPY
-    then writes it as a native Parquet GEOMETRY logical type. That is the #706
-    bug reappearing through the other carrier shape, and it is illegal below
-    GeoParquet 2.0 (#727).
-    """
-    import pyarrow as pa
-
-    from geoparquet_io.core.write_strategies.arrow_streaming import _to_plain_wkb_array
-
-    index = table.schema.get_field_index(column)
-    field = table.schema.field(index)
-    if getattr(field.type, "extension_name", None) is not None:
-        return table  # resolved extension type: already handled by the strip above
-    if arrow_extension_name(field) is None:
-        return table
-    plain_field = pa.field(column, pa.binary(), nullable=field.nullable)
-    return table.set_column(index, plain_field, _to_plain_wkb_array(table.column(index)))
 
 
 def _build_copy_options(
