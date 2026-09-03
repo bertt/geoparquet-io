@@ -17,7 +17,6 @@ from geoparquet_io.core.crs_utils import (
 )
 from geoparquet_io.core.duckdb_utils import (
     _DuckDBSchemaWrapper,
-    _escape_sql_string,
     _get_query_column_type,
     _get_query_columns,
     _wrap_query_with_wkb_conversion,
@@ -25,6 +24,7 @@ from geoparquet_io.core.duckdb_utils import (
     get_duckdb_connection,
     load_community_extension,
     quote_identifier,
+    sql_path,
     validate_compression_level,
 )
 from geoparquet_io.core.exceptions import (
@@ -36,7 +36,7 @@ from geoparquet_io.core.file_utils import (
     _get_file_cache_key,
     get_first_parquet_file,
     is_partition_path,
-    safe_file_url,
+    resolve_file_url,
 )
 from geoparquet_io.core.geo_metadata import (
     DEFAULT_GEOPARQUET_VERSION,
@@ -281,7 +281,9 @@ def calculate_file_bounds(file_path, geom_column=None, verbose=False):
     if geom_column is None:
         geom_column = find_primary_geometry_column(file_path, verbose=False)
 
-    safe_url = safe_file_url(file_path, verbose=False)
+    # RAW path: sql_path escapes it at the point of interpolation, so nothing
+    # downstream can escape it a second time (#802).
+    read_url = resolve_file_url(file_path, verbose=False)
     con = get_duckdb_connection(load_spatial=True, load_httpfs=needs_httpfs(file_path))
 
     try:
@@ -291,7 +293,7 @@ def calculate_file_bounds(file_path, geom_column=None, verbose=False):
                 MIN(ST_YMin({quote_identifier(geom_column)})) as ymin,
                 MAX(ST_XMax({quote_identifier(geom_column)})) as xmax,
                 MAX(ST_YMax({quote_identifier(geom_column)})) as ymax
-            FROM read_parquet('{safe_url}')
+            FROM read_parquet({sql_path(read_url)})
         """
         result = con.execute(bounds_query).fetchone()
 
@@ -2374,8 +2376,6 @@ def _plain_copy_to(
     # Parquet schema during COPY TO — no post-processing file rewrite needed.
     final_query = _wrap_query_with_crs(query, geometry_column, input_crs)
 
-    escaped_path = _escape_sql_string(output_path)
-
     # Build options list
     options = [
         "FORMAT PARQUET",
@@ -2402,7 +2402,7 @@ def _plain_copy_to(
 
     copy_query = f"""
         COPY ({final_query})
-        TO '{escaped_path}'
+        TO {sql_path(output_path)}
         ({", ".join(options)})
     """
 
@@ -3389,8 +3389,12 @@ def get_bbox_advice(
     return result
 
 
-def _build_bounds_query(safe_url, bbox_info, geometry_column, verbose):
-    """Build query for bounds calculation."""
+def _build_bounds_query(parquet_path, bbox_info, geometry_column, verbose):
+    """Build query for bounds calculation.
+
+    ``parquet_path`` is RAW: ``sql_path`` quotes and escapes it here, at the one
+    point it becomes SQL (#802).
+    """
     if bbox_info["has_bbox_column"]:
         bbox_col = bbox_info["bbox_column_name"]
         if verbose:
@@ -3403,7 +3407,7 @@ def _build_bounds_query(safe_url, bbox_info, geometry_column, verbose):
             MIN({q_bbox}.ymin) as ymin,
             MAX({q_bbox}.xmax) as xmax,
             MAX({q_bbox}.ymax) as ymax
-        FROM '{safe_url}'
+        FROM {sql_path(parquet_path)}
         """
     else:
         warn(
@@ -3418,7 +3422,7 @@ def _build_bounds_query(safe_url, bbox_info, geometry_column, verbose):
             MIN(ST_YMin({q_geom})) as ymin,
             MAX(ST_XMax({q_geom})) as xmax,
             MAX(ST_YMax({q_geom})) as ymax
-        FROM '{safe_url}'
+        FROM {sql_path(parquet_path)}
         """
 
 
@@ -3438,7 +3442,7 @@ def get_dataset_bounds(parquet_file, geometry_column=None, verbose=False):
         tuple: (xmin, ymin, xmax, ymax) or None if error
     """
     configure_verbose(verbose)
-    safe_url = safe_file_url(parquet_file, verbose)
+    read_url = resolve_file_url(parquet_file, verbose)
 
     # Get geometry column if not specified
     if not geometry_column:
@@ -3451,7 +3455,7 @@ def get_dataset_bounds(parquet_file, geometry_column=None, verbose=False):
     con = get_duckdb_connection(load_spatial=True, load_httpfs=needs_httpfs(parquet_file))
 
     try:
-        query = _build_bounds_query(safe_url, bbox_info, geometry_column, verbose)
+        query = _build_bounds_query(read_url, bbox_info, geometry_column, verbose)
         result = con.execute(query).fetchone()
 
         if result and all(v is not None for v in result):
@@ -3532,8 +3536,9 @@ def add_computed_column(
             custom_metadata={'covering': {'h3': {'column': 'h3_cell', 'resolution': 9}}}
         )
     """
-    # Get safe URL for input file
-    input_url = safe_file_url(input_parquet, verbose)
+    # RAW path: the dry-run header below shows it to the user, and every SQL
+    # interpolation escapes it through sql_path (#802).
+    input_path = resolve_file_url(input_parquet, verbose)
 
     # Get geometry column (for reference)
     geom_col = find_primary_geometry_column(input_parquet, verbose)
@@ -3542,7 +3547,7 @@ def add_computed_column(
     if dry_run:
         warn("\n=== DRY RUN MODE - SQL Commands that would be executed ===\n")
         display_input = (
-            _sanitize_url_for_logging(input_url) if is_remote_url(input_url) else input_url
+            _sanitize_url_for_logging(input_path) if is_remote_url(input_path) else input_path
         )
         display_output = (
             _sanitize_url_for_logging(output_parquet)
@@ -3594,7 +3599,7 @@ def add_computed_column(
 
     # Get total count (skip in dry-run)
     if not dry_run:
-        total_count = con.execute(f"SELECT COUNT(*) FROM '{input_url}'").fetchone()[0]
+        total_count = con.execute(f"SELECT COUNT(*) FROM {sql_path(input_path)}").fetchone()[0]
         progress(f"Processing {total_count:,} features...")
 
     # Build the query
@@ -3607,14 +3612,14 @@ def add_computed_column(
         SELECT
             * EXCLUDE ({quote_identifier(replace_column)}),
             {sql_expression} AS {quoted_col}
-        FROM '{input_url}'
+        FROM {sql_path(input_path)}
     """
     else:
         query = f"""
         SELECT
             *,
             {sql_expression} AS {quoted_col}
-        FROM '{input_url}'
+        FROM {sql_path(input_path)}
     """
 
     # Handle dry-run display
@@ -3628,7 +3633,7 @@ def add_computed_column(
             compression.lower() if compression != "UNCOMPRESSED" else "uncompressed"
         )
         display_query = f"""COPY ({query.strip()})
-TO '{output_parquet}'
+TO {sql_path(output_parquet)}
 (FORMAT PARQUET, COMPRESSION '{duckdb_compression}');"""
 
         info("-- Main query:")

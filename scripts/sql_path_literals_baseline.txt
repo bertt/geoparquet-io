@@ -5,19 +5,11 @@
 2 geoparquet_io/api/ops.py
 1 geoparquet_io/api/table.py
 1 geoparquet_io/cli/main.py
-2 geoparquet_io/core/add/admin_divisions.py
-4 geoparquet_io/core/add/bbox_metadata.py
-11 geoparquet_io/core/add/country_codes.py
-1 geoparquet_io/core/add/geometry_metrics.py
-5 geoparquet_io/core/add/kdtree.py
-1 geoparquet_io/core/add/quadkey.py
-5 geoparquet_io/core/admin_datasets.py
 1 geoparquet_io/core/arcgis.py
 7 geoparquet_io/core/benchmark.py
 2 geoparquet_io/core/carto.py
 3 geoparquet_io/core/check_fixes.py
 3 geoparquet_io/core/check_spatial_order.py
-8 geoparquet_io/core/common.py
 5 geoparquet_io/core/convert.py
 2 geoparquet_io/core/crs_utils.py
 13 geoparquet_io/core/duckdb_metadata.py
@@ -30,7 +22,6 @@
 6 geoparquet_io/core/inspect_utils.py
 2 geoparquet_io/core/layers.py
 1 geoparquet_io/core/metadata_utils.py
-3 geoparquet_io/core/partition/admin_hierarchical.py
 4 geoparquet_io/core/partition/auto_resolution.py
 4 geoparquet_io/core/partition/common.py
 2 geoparquet_io/core/partition/reader.py
