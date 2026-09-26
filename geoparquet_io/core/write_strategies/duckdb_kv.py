@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import duckdb
 import pyarrow.parquet as pq
 
 from geoparquet_io.core.arrow_geo_metadata import (
@@ -29,16 +29,17 @@ from geoparquet_io.core.arrow_geo_metadata import (
 )
 from geoparquet_io.core.crs_utils import _wrap_query_with_crs as _common_wrap_query_with_crs
 from geoparquet_io.core.duckdb_utils import (
-    _escape_sql_string,
     _wrap_query_with_blob_conversion,
     build_kv_metadata_clause,
     quote_identifier,
+    restore_duckdb_settings,
     sql_path,
     validate_compression_level,
 )
 from geoparquet_io.core.geo_metadata import compute_geo_stats_via_sql, declare_carried_bbox_column
 from geoparquet_io.core.geoarrow_encoding import arrow_extension_name
 from geoparquet_io.core.logging_config import configure_verbose, debug, success
+from geoparquet_io.core.memory_limits import get_default_memory_limit, validate_memory_limit
 from geoparquet_io.core.remote import is_remote_url, upload_if_remote
 from geoparquet_io.core.write_strategies.base import (
     BaseWriteStrategy,
@@ -48,120 +49,10 @@ from geoparquet_io.core.write_strategies.base import (
 from geoparquet_io.core.write_strategies.row_group_sizing import _resolve_row_group_rows
 
 if TYPE_CHECKING:
-    import duckdb
     import pyarrow as pa
 
 # Valid compression values whitelist (prevents injection via compression param)
 VALID_COMPRESSIONS = frozenset({"ZSTD", "SNAPPY", "GZIP", "LZ4", "UNCOMPRESSED", "BROTLI"})
-
-# DuckDB's memory_limit is a SET value, which cannot be parameterised, so the
-# value has to be interpolated into SQL. Only accept a plain size literal: a
-# decimal number with an optional decimal (KB/MB/GB/TB) or binary (KiB/…) unit.
-_MEMORY_LIMIT_RE = re.compile(r"^\d+(\.\d+)?\s*(K|M|G|T)?i?B$", re.IGNORECASE)
-
-
-def validate_memory_limit(value: str) -> str:
-    """Validate/normalize a DuckDB memory limit before interpolating it into SQL.
-
-    ``memory_limit`` originates from ``--write-memory`` (or from a library
-    caller's config) and ends up inside ``SET memory_limit = '…'``. DuckDB's
-    ``execute`` runs multi-statement strings, so an unvalidated value can close
-    the string literal and append arbitrary SQL. Reject anything that is not a
-    plain size.
-
-    Args:
-        value: Candidate memory limit, e.g. "512MB", "2GB", "4.5 GB", "1GiB"
-
-    Returns:
-        The normalized value (whitespace removed, unit upper-cased).
-
-    Raises:
-        ValueError: If the value is not a plain size literal.
-    """
-    text = str(value).strip()
-    if not _MEMORY_LIMIT_RE.match(text):
-        raise ValueError(
-            f"Invalid memory_limit {value!r}; expected a size like "
-            f"'512MB', '2GB', '4.5GB', or '1GiB'."
-        )
-    return text.upper().replace(" ", "")
-
-
-def _get_available_memory() -> int | None:
-    """
-    Get available memory in bytes, accounting for container limits.
-
-    Checks cgroup v2 and v1 limits first (Docker, Kubernetes, etc.),
-    then falls back to psutil for bare-metal systems.
-
-    Returns:
-        Available memory in bytes, or None if detection fails
-    """
-    # Check cgroup v2 memory limit (Docker, Kubernetes)
-    try:
-        with open("/sys/fs/cgroup/memory.max") as f:
-            limit = f.read().strip()
-            if limit != "max":
-                cgroup_limit = int(limit)
-                # Try to get current usage to calculate available
-                try:
-                    with open("/sys/fs/cgroup/memory.current") as f2:
-                        current = int(f2.read().strip())
-                        return cgroup_limit - current
-                except (FileNotFoundError, ValueError):
-                    # Return 80% of limit if we can't get current usage
-                    return int(cgroup_limit * 0.8)
-    except (FileNotFoundError, ValueError):
-        pass
-
-    # Check cgroup v1 memory limit
-    try:
-        with open("/sys/fs/cgroup/memory/memory.limit_in_bytes") as f:
-            limit = int(f.read().strip())
-            # Values near 2^63 indicate no limit
-            if limit < 2**60:
-                try:
-                    with open("/sys/fs/cgroup/memory/memory.usage_in_bytes") as f2:
-                        usage = int(f2.read().strip())
-                        return limit - usage
-                except (FileNotFoundError, ValueError):
-                    return int(limit * 0.8)
-    except (FileNotFoundError, ValueError):
-        pass
-
-    # Fall back to psutil for non-containerized environments
-    try:
-        import psutil
-
-        return psutil.virtual_memory().available
-    except ImportError:
-        return None
-
-
-def get_default_memory_limit() -> str:
-    """
-    Get default memory limit for DuckDB streaming (50% of available RAM).
-
-    Container-aware: detects Docker/Kubernetes memory limits via cgroups
-    before falling back to psutil for bare-metal systems.
-
-    Returns:
-        Memory limit string for DuckDB (e.g., '2GB', '512MB')
-    """
-    available = _get_available_memory()
-
-    if available is None:
-        return "2GB"  # Conservative fallback
-
-    # Use 50% of available memory
-    limit_bytes = int(available * 0.5)
-    limit_gb = limit_bytes / (1024**3)
-
-    if limit_gb >= 1:
-        return f"{limit_gb:.1f}GB"
-
-    limit_mb = limit_bytes / (1024**2)
-    return f"{max(128, int(limit_mb))}MB"  # Minimum 128MB
 
 
 def _wrap_query_with_crs(
@@ -346,43 +237,12 @@ class DuckDBKVStrategy(BaseWriteStrategy):
                 upload_if_remote(local_path, output_path, is_directory=False, verbose=verbose)
 
         finally:
-            self._restore_duckdb_settings(con, saved_settings, verbose)
+            restore_duckdb_settings(con, saved_settings, verbose)
             if is_remote and Path(local_path).exists():
                 Path(local_path).unlink()
 
     #: Session settings this strategy overrides for the duration of one write.
     _MANAGED_SETTINGS = ("threads", "preserve_insertion_order", "memory_limit")
-
-    def _restore_duckdb_settings(
-        self,
-        con: duckdb.DuckDBPyConnection,
-        saved: dict[str, object],
-        verbose: bool,
-    ) -> None:
-        """Put back the session settings this strategy clamped.
-
-        The connection belongs to the caller, not to this write. Leaving
-        threads=1 and a halved memory_limit behind meant one write pinned every
-        later query on that connection -- partition loops finalize N files on a
-        shared connection, so the first partition throttled the whole run, and
-        the Python API holds a connection across operations.
-        """
-        for key, value in saved.items():
-            try:
-                if isinstance(value, str):
-                    con.execute(f"SET {key} = '{_escape_sql_string(value)}'")
-                else:
-                    con.execute(f"SET {key} = {value}")
-                # DuckDB reports sizes as rounded display strings ("14.3 GiB"),
-                # so writing one back can land a hair off and drift further on
-                # every write in a partition loop. A value that will not
-                # round-trip was the engine's own default, so ask for that
-                # instead of an approximation of it.
-                if con.execute(f"SELECT current_setting('{key}')").fetchone()[0] != value:
-                    con.execute(f"RESET {key}")
-            except duckdb.Error as e:  # pragma: no cover - defensive
-                if verbose:
-                    debug(f"Could not restore DuckDB setting {key}: {e}")
 
     def _configure_duckdb_memory(
         self,
@@ -393,7 +253,7 @@ class DuckDBKVStrategy(BaseWriteStrategy):
         """Configure DuckDB memory settings for streaming.
 
         Returns the prior values so the caller can restore them; see
-        ``_restore_duckdb_settings``.
+        ``restore_duckdb_settings``.
         """
         saved: dict[str, object] = {}
         for key in self._MANAGED_SETTINGS:
