@@ -39,6 +39,7 @@ from geoparquet_io.core.crs_utils import _wrap_query_with_crs, apply_output_crs
 from geoparquet_io.core.derive_geo_from_file import (
     _ensure_v2_geo_metadata,
     _rewrite_file_with_geo_metadata,
+    derive_secondary_geometry_info,
 )
 from geoparquet_io.core.duckdb_metadata import (
     get_geo_metadata,
@@ -358,6 +359,20 @@ def _custom_covering_survives(covering, original_metadata, geometry_column, outp
     return isinstance(carried_covering, dict) and "bbox" in carried_covering
 
 
+def _probe_output_columns(con, query: str, verbose: bool, purpose: str) -> list[str] | None:
+    """The output query's column names, or ``None`` when the probe fails.
+
+    Best-effort by design: every caller treats an unreadable schema as "unknown"
+    rather than aborting the write.
+    """
+    try:
+        return _get_query_columns(con, query)
+    except (duckdb.Error, RuntimeError, ValueError, AttributeError) as e:
+        if verbose:
+            debug(f"Could not read output schema to {purpose}: {e}")
+        return None
+
+
 def _prune_metadata_to_output_columns(
     con,
     query: str,
@@ -377,11 +392,8 @@ def _prune_metadata_to_output_columns(
     if not original_metadata:
         return original_metadata, None
 
-    try:
-        output_columns = _get_query_columns(con, query)
-    except (duckdb.Error, RuntimeError, ValueError, AttributeError) as e:
-        if verbose:
-            debug(f"Could not read output schema to prune geo metadata: {e}")
+    output_columns = _probe_output_columns(con, query, verbose, "prune geo metadata")
+    if output_columns is None:
         return original_metadata, None
 
     pruned = prune_geo_metadata_to_columns(original_metadata, output_columns)
@@ -669,8 +681,9 @@ def write_parquet_with_metadata(
             invalidates every column, which is right for a merge: its carried
             stats under-cover every column of the output. An invalidated column
             other than the primary keeps ``geometry_types`` as the spec's empty
-            "not known" list rather than losing the key, since nothing here
-            recomputes it (#934).
+            "not known" list rather than losing the key (#934); the duckdb-kv
+            strategy then recomputes it from the rows it writes (#952), the
+            others write the sentinel.
         drop_nonplanar_edges_columns: Geometry columns whose non-planar
             ``edges`` declaration must neither be carried through nor
             re-attached to the output. Set by writes that invalidate the edge
@@ -702,10 +715,11 @@ def write_parquet_with_metadata(
     # caller that transforms only some geometry columns names them, so an
     # untouched secondary column keeps the stats that still describe it (#890).
     #
-    # Every strategy recomputes `geometry_column` and only that, so a stripped
-    # SECONDARY column would be left with no `geometry_types` at all -- a key
-    # GeoParquet 1.1 requires and DuckDB refuses to open a file without. Naming
-    # the recomputed column leaves the others the "not known" sentinel (#934).
+    # Every strategy recomputes `geometry_column`; only duckdb-kv also fills a
+    # SECONDARY column's gap (#952), so a stripped secondary would otherwise be
+    # left with no `geometry_types` at all -- a key GeoParquet 1.1 requires and
+    # DuckDB refuses to open a file without. Naming the recomputed column leaves
+    # the others the "not known" sentinel (#934), which duckdb-kv treats as a gap.
     if invalidate_derived_stats:
         original_metadata = strip_derived_stats(
             original_metadata,
@@ -896,6 +910,25 @@ def write_parquet_with_metadata(
             if verbose:
                 debug(f"Writing GeoParquet version: {effective_version}")
                 debug(f"Using write strategy: {strategy.name}")
+
+            # The input-file witness answers one more question here: which OTHER
+            # geometry columns does this rewrite carry? Callers that know pass
+            # `geometry_info` themselves (convert); every rewrite that does not --
+            # the `add` family, sort, extract -- used to leave a secondary column
+            # undescribed in `geo.columns`, which 2.0 requires for every geometry
+            # column in the file (#1000). Each secondary's CRS comes from its own
+            # logical type, never the per-file witness's. Gated on knowing the
+            # output's columns, so a projection cannot come out declaring a
+            # geometry column it dropped.
+            if geometry_info is None and input_file and geometry_column:
+                if output_columns is None:
+                    output_columns = _probe_output_columns(
+                        con, query, verbose, "derive secondary geometry"
+                    )
+                if output_columns is not None:
+                    geometry_info = derive_secondary_geometry_info(
+                        input_file, geometry_column, output_columns=output_columns, verbose=verbose
+                    )
 
             # Build kwargs - only pass memory_limit for duckdb-kv
             write_kwargs = {
