@@ -499,7 +499,7 @@ def test_the_probe_uses_a_temporary_client_not_the_shared_one(monkeypatch):
     http.respond(_is_getfeature, geojson_reply(_geojson(100)))
 
     # Run the probe first
-    result = _probe_startindex_limit(SERVICE, TYPENAME, "1.1.0")
+    _probe_startindex_limit(SERVICE, TYPENAME, "1.1.0")
 
     # Then fetch a page
     _fetch_wfs_page(SERVICE, output_format="application/json")

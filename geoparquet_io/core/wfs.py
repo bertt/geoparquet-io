@@ -26,6 +26,7 @@ from typing import Final
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import duckdb
+import httpx
 import pyarrow as pa
 
 # Public API
