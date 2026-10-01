@@ -60,9 +60,7 @@ _CLIENT_SEAMS = (
 
 # Temporary client getters (no reset needed). Each entry is
 # (module, getter attribute).
-_TEMPORARY_CLIENT_SEAMS = (
-    ("geoparquet_io.core.wfs", "_get_temporary_http_client"),
-)
+_TEMPORARY_CLIENT_SEAMS = (("geoparquet_io.core.wfs", "_get_temporary_http_client"),)
 
 
 @dataclass(frozen=True)

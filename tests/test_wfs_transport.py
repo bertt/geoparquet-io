@@ -513,7 +513,6 @@ def test_the_probe_uses_a_temporary_client_not_the_shared_one(monkeypatch):
     assert http.client_timeouts[1] == 600
 
 
-
 # ---------------------------------------------------------------------------
 # _fetch_wfs_page - streaming, content-type dispatch, retries
 # ---------------------------------------------------------------------------
