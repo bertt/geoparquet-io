@@ -269,6 +269,7 @@ class FakeTransport:
             Supports close() without actually closing the shared client,
             allowing temporary clients to be closed independently in tests.
             """
+
             def __init__(self, wrapped: httpx.Client) -> None:
                 self._wrapped = wrapped
 
