@@ -2461,21 +2461,24 @@ def _probe_startindex_limit(
         # page fetches at 30 seconds regardless of their own timeout request
         # (issue #1184).
         client = _get_temporary_http_client(timeout=30)
-        response = client.get(url, headers={"Accept-Encoding": "gzip, deflate"})
-        if response.status_code == 400:
-            body = response.text.lower()
-            if "startindex" in body:
-                import re as _re
+        try:
+            response = client.get(url, headers={"Accept-Encoding": "gzip, deflate"})
+            if response.status_code == 400:
+                body = response.text.lower()
+                if "startindex" in body:
+                    import re as _re
 
-                match = _re.search(r"startindex.*?(\d[\d.,]+)", body)
-                if match:
-                    limit_str = match.group(1).replace(",", "").replace(".", "")
-                    try:
-                        return int(limit_str)
-                    except ValueError:
-                        pass
-                return 50000
-        return None
+                    match = _re.search(r"startindex.*?(\d[\d.,]+)", body)
+                    if match:
+                        limit_str = match.group(1).replace(",", "").replace(".", "")
+                        try:
+                            return int(limit_str)
+                        except ValueError:
+                            pass
+                    return 50000
+            return None
+        finally:
+            client.close()
     except (WFSError, httpx.HTTPError, OSError) as e:
         # Same contract as _get_feature_count: expected transport failures
         # degrade to "no limit known" but say so, because that answer silently
