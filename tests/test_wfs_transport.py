@@ -491,6 +491,29 @@ def test_a_failed_startindex_probe_warns_about_unbounded_pagination(monkeypatch,
     assert "pagination past a server's limit" in caplog.text
 
 
+def test_the_probe_uses_a_temporary_client_not_the_shared_one(monkeypatch):
+    """The probe's 30-second timeout must not pin the shared client's timeout."""
+    http = FakeTransport.install(monkeypatch)
+    # Register probes: startindex probe and a page fetch
+    http.respond(_is_startindex_probe, geojson_reply(_geojson(0)))
+    http.respond(_is_getfeature, geojson_reply(_geojson(100)))
+
+    # Run the probe first
+    result = _probe_startindex_limit(SERVICE, TYPENAME, "1.1.0")
+
+    # Then fetch a page
+    _fetch_wfs_page(SERVICE, output_format="application/json")
+
+    # The probe should use a 30-second timeout, the page fetch should use 600 seconds.
+    # Both should be recorded by the test mock.
+    assert 30.0 in http.client_timeouts, f"Expected 30.0 in {http.client_timeouts}"
+    assert 600 in http.client_timeouts, f"Expected 600 in {http.client_timeouts}"
+    # Confirm the order: probe first with 30s, then page with 600s
+    assert http.client_timeouts[0] == 30.0
+    assert http.client_timeouts[1] == 600
+
+
+
 # ---------------------------------------------------------------------------
 # _fetch_wfs_page - streaming, content-type dispatch, retries
 # ---------------------------------------------------------------------------
