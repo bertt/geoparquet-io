@@ -513,6 +513,31 @@ def test_the_probe_uses_a_temporary_client_not_the_shared_one(monkeypatch):
     assert http.client_timeouts[1] == 600
 
 
+def test_probe_handles_400_error_without_startindex_keyword(monkeypatch):
+    """A 400 response without 'startindex' keyword returns None."""
+    http = FakeTransport.install(monkeypatch)
+    http.respond(
+        _is_startindex_probe,
+        bytes_reply(b"Bad Request: Invalid parameter", status=400, content_type="text/plain"),
+    )
+
+    result = _probe_startindex_limit(SERVICE, TYPENAME, "1.1.0")
+    assert result is None
+
+
+def test_probe_handles_unparseable_limit_string(monkeypatch):
+    """A limit string that can't be parsed as int falls back to 50000."""
+    http = FakeTransport.install(monkeypatch)
+    # Send a response with 'startindex' but an unparseable limit value
+    http.respond(
+        _is_startindex_probe,
+        bytes_reply(b"Error: startIndex is limited to ABC features", status=400, content_type="text/plain"),
+    )
+
+    result = _probe_startindex_limit(SERVICE, TYPENAME, "1.1.0")
+    assert result == 50000
+
+
 # ---------------------------------------------------------------------------
 # _fetch_wfs_page - streaming, content-type dispatch, retries
 # ---------------------------------------------------------------------------
