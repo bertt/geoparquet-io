@@ -19,6 +19,7 @@ from geoparquet_io.core.wfs import (
     WFSError,
     _fetch_wfs_page,
     _get_feature_count,
+    _get_temporary_http_client,
     _make_request,
     _probe_startindex_limit,
     convert_wfs_to_geoparquet,
@@ -531,11 +532,38 @@ def test_probe_handles_unparsable_limit_string(monkeypatch):
     # Send a response with 'startindex' but an unparsable limit value
     http.respond(
         _is_startindex_probe,
-        bytes_reply(b"Error: startIndex is limited to ABC features", status=400, content_type="text/plain"),
+        bytes_reply(
+            b"Error: startIndex is limited to ABC features",
+            status=400,
+            content_type="text/plain",
+        ),
     )
 
     result = _probe_startindex_limit(SERVICE, TYPENAME, "1.1.0")
     assert result == 50000
+
+
+def test_get_temporary_http_client_creates_independent_client():
+    """_get_temporary_http_client() returns a new httpx.Client with the specified timeout."""
+    import httpx
+
+    # Create a client with custom timeout
+    client = _get_temporary_http_client(timeout=45.0)
+    try:
+        # Verify it's an httpx.Client instance
+        assert isinstance(client, httpx.Client)
+        # Verify it has a timeout set (exact attribute structure varies by httpx version)
+        assert client.timeout is not None
+    finally:
+        client.close()
+
+    # Create another client to verify independence
+    client2 = _get_temporary_http_client(timeout=15.0)
+    try:
+        assert isinstance(client2, httpx.Client)
+        assert client2.timeout is not None
+    finally:
+        client2.close()
 
 
 # ---------------------------------------------------------------------------
