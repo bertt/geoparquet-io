@@ -525,10 +525,10 @@ def test_probe_handles_400_error_without_startindex_keyword(monkeypatch):
     assert result is None
 
 
-def test_probe_handles_unparseable_limit_string(monkeypatch):
+def test_probe_handles_unparsable_limit_string(monkeypatch):
     """A limit string that can't be parsed as int falls back to 50000."""
     http = FakeTransport.install(monkeypatch)
-    # Send a response with 'startindex' but an unparseable limit value
+    # Send a response with 'startindex' but an unparsable limit value
     http.respond(
         _is_startindex_probe,
         bytes_reply(b"Error: startIndex is limited to ABC features", status=400, content_type="text/plain"),
