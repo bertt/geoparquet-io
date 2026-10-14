@@ -26,7 +26,6 @@ from typing import Final
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import duckdb
-import httpx
 import pyarrow as pa
 
 # Public API
@@ -171,6 +170,11 @@ class WFSLayerInfo:
 
 # Default timeout for HTTP requests (seconds)
 DEFAULT_TIMEOUT = 60.0
+# A GetFeature page can take minutes on a large layer; the startIndex probe
+# asks for one feature. Both are passed per request, never only to the shared
+# client, which keeps the timeout of whichever caller built it (#1184).
+_PAGE_TIMEOUT = 600.0
+_PROBE_TIMEOUT = 30.0
 
 
 def _get_shared_http_client(timeout: float = DEFAULT_TIMEOUT):
@@ -230,7 +234,10 @@ def _make_request(
             debug(f"HTTP GET: {request_desc[:100]}{'...' if len(request_desc) > 100 else ''}")
             start_time = time.time()
             client = _get_shared_http_client(timeout=timeout)
-            response = client.get(url, params=params, headers=headers)
+            # The timeout rides on the request, not just the client: the shared
+            # client keeps the timeout of whichever caller built it first, so a
+            # client-level timeout alone would cap every later caller (#1184).
+            response = client.get(url, params=params, headers=headers, timeout=timeout)
             elapsed = time.time() - start_time
             response.raise_for_status()
             content = bytes(response.content)
@@ -2035,12 +2042,15 @@ def _fetch_wfs_page(
         body_kind = "json"
         total_bytes = 0
         try:
-            client = _get_shared_http_client(timeout=600)
+            client = _get_shared_http_client(timeout=_PAGE_TIMEOUT)
 
+            # Per-request timeout: the shared client was usually built by the
+            # 60s feature-count probe, and keeps that timeout (#1184).
             with client.stream(
                 "GET",
                 url,
                 headers={"Accept": accept, "Accept-Encoding": "gzip, deflate"},
+                timeout=_PAGE_TIMEOUT,
             ) as response:
                 # Check HTTP status
                 if response.status_code == 400:
@@ -2399,25 +2409,6 @@ def _fetch_with_spatial_tiles(
     return _with_server_crs(_infer_column_types(combined), server_crs)
 
 
-def _get_temporary_http_client(timeout: float = 30.0) -> httpx.Client:
-    """
-    Create a short-lived HTTP client for a single operation.
-
-    This is used by lightweight probes (like the startIndex limit detection)
-    that should not pin the shared connection pool's timeout. The client
-    should be closed/exited from its context after use.
-
-    Args:
-        timeout: Request timeout in seconds
-
-    Returns:
-        A new httpx.Client instance (not cached)
-    """
-    import httpx
-
-    return httpx.Client(timeout=timeout, follow_redirects=True)
-
-
 def _probe_startindex_limit(
     service_url: str,
     typename: str,
@@ -2454,31 +2445,26 @@ def _probe_startindex_limit(
     )
 
     try:
-        # Use a short-lived client for the probe instead of the shared client.
-        # The probe has a 30-second timeout, while the actual page fetches
-        # request 600 seconds. If we used the shared client, the probe would
-        # create the singleton with a 30-second timeout, pinning all subsequent
-        # page fetches at 30 seconds regardless of their own timeout request
-        # (issue #1184).
-        client = _get_temporary_http_client(timeout=30)
-        try:
-            response = client.get(url, headers={"Accept-Encoding": "gzip, deflate"})
-            if response.status_code == 400:
-                body = response.text.lower()
-                if "startindex" in body:
-                    import re as _re
+        client = _get_shared_http_client(timeout=_PROBE_TIMEOUT)
+        # Per-request timeout, so this probe neither inherits nor pins the
+        # shared client's timeout (#1184).
+        response = client.get(
+            url, headers={"Accept-Encoding": "gzip, deflate"}, timeout=_PROBE_TIMEOUT
+        )
+        if response.status_code == 400:
+            body = response.text.lower()
+            if "startindex" in body:
+                import re as _re
 
-                    match = _re.search(r"startindex.*?(\d[\d.,]+)", body)
-                    if match:
-                        limit_str = match.group(1).replace(",", "").replace(".", "")
-                        try:
-                            return int(limit_str)
-                        except ValueError:
-                            pass
-                    return 50000
-            return None
-        finally:
-            client.close()
+                match = _re.search(r"startindex.*?(\d[\d.,]+)", body)
+                if match:
+                    limit_str = match.group(1).replace(",", "").replace(".", "")
+                    try:
+                        return int(limit_str)
+                    except ValueError:
+                        pass
+                return 50000
+        return None
     except (WFSError, httpx.HTTPError, OSError) as e:
         # Same contract as _get_feature_count: expected transport failures
         # degrade to "no limit known" but say so, because that answer silently

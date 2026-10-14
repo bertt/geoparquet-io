@@ -58,10 +58,6 @@ _CLIENT_SEAMS = (
     ("geoparquet_io.core.wfs", "_get_shared_http_client_base", "_reset_http_client_base"),
 )
 
-# Temporary client getters (no reset needed). Each entry is
-# (module, getter attribute).
-_TEMPORARY_CLIENT_SEAMS = (("geoparquet_io.core.wfs", "_get_temporary_http_client"),)
-
 
 @dataclass(frozen=True)
 class RecordedRequest:
@@ -250,43 +246,29 @@ class FakeTransport:
     def install(cls, monkeypatch: pytest.MonkeyPatch) -> FakeTransport:
         """Redirect the shared HTTP client and the retry sleeps at this test."""
         fake = cls()
-        client = httpx.Client(transport=httpx.MockTransport(fake._handle), follow_redirects=True)
+        # Model the real singleton: the client is built once, by the first
+        # caller, with *that caller's* timeout, and kept until a reset. A later
+        # caller asking for another timeout gets the same client back, so a
+        # request's recorded ``timeout`` is what production would apply (#1184).
+        pool: dict[str, httpx.Client] = {}
 
         def _get_client(timeout: float = 60.0, **_kwargs: Any) -> httpx.Client:
             fake.client_timeouts.append(timeout)
-            return client
+            if "client" not in pool:
+                pool["client"] = httpx.Client(
+                    transport=httpx.MockTransport(fake._handle),
+                    follow_redirects=True,
+                    timeout=timeout,
+                )
+            return pool["client"]
 
         def _reset() -> None:
             fake.resets += 1
+            pool.pop("client", None)
 
         for module_name, getter, resetter in _CLIENT_SEAMS:
             monkeypatch.setattr(f"{module_name}.{getter}", _get_client)
             monkeypatch.setattr(f"{module_name}.{resetter}", _reset)
-
-        class _TemporaryClientWrapper:
-            """Wraps the shared client for temporary probe operations.
-
-            Supports close() without actually closing the shared client,
-            allowing temporary clients to be closed independently in tests.
-            """
-
-            def __init__(self, wrapped: httpx.Client) -> None:
-                self._wrapped = wrapped
-
-            def __getattr__(self, name: str) -> Any:
-                return getattr(self._wrapped, name)
-
-            def close(self) -> None:
-                # Don't close the wrapped shared client
-                pass
-
-        def _get_temporary_client(timeout: float = 30.0) -> httpx.Client:
-            """Return a temporary client (wrapped in tests to avoid closing shared client)."""
-            fake.client_timeouts.append(timeout)
-            return _TemporaryClientWrapper(client)  # type: ignore
-
-        for module_name, getter in _TEMPORARY_CLIENT_SEAMS:
-            monkeypatch.setattr(f"{module_name}.{getter}", _get_temporary_client)
 
         shim = _TimeShim(fake.sleeps)
         for module_name in _TIME_PATCHED_MODULES:
