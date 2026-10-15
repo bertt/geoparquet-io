@@ -1407,6 +1407,12 @@ When you already know the page size a layer tolerates, set it up front with `--b
     table.write("out.parquet")
     ```
 
+### Polygon ring handling (`OGR_ORGANIZE_POLYGONS=ONLY_CCW`)
+
+When ArcGIS returns EsriJSON (used with `--output-crs`/native-CRS downloads), gpio reads each page with GDAL's `OGR_ORGANIZE_POLYGONS` config option set to `ONLY_CCW`. This skips GDAL's ring-containment analysis, which is slow on large, complex polygons, and instead trusts the ring winding order that ArcGIS already provides (outer rings one way, holes the other). Reads are noticeably faster for polygon layers.
+
+The variable is set only while a page is being read and is restored afterwards, so it does not affect other GDAL work in your process. GeoJSON pages (the default WGS84 path) are not affected. If you need GDAL's default behavior for EsriJSON, that is not currently configurable.
+
 ### Finding Service URLs
 
 ArcGIS Feature Service URLs follow this pattern:

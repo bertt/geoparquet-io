@@ -1467,6 +1467,31 @@ class TestStreamingConversion:
             "the GDAL size limit leaked out of the page conversion"
         )
 
+    def test_esrijson_page_uses_only_ccw_scoped(self, monkeypatch):
+        """ESRIJSON reads set OGR_ORGANIZE_POLYGONS=ONLY_CCW, restored afterwards."""
+        import os
+
+        from geoparquet_io.core import arcgis
+
+        monkeypatch.delenv("OGR_ORGANIZE_POLYGONS", raising=False)
+        arcgis._esrijson_page_to_table(MOCK_ESRI_FEATURES_PAGE)
+        assert "OGR_ORGANIZE_POLYGONS" not in os.environ
+
+        monkeypatch.setenv("OGR_ORGANIZE_POLYGONS", "DEFAULT")
+        with arcgis._gdal_organize_polygons("ONLY_CCW"):
+            assert os.environ["OGR_ORGANIZE_POLYGONS"] == "ONLY_CCW"
+        assert os.environ["OGR_ORGANIZE_POLYGONS"] == "DEFAULT"
+
+    def test_geojson_page_does_not_set_organize_polygons(self, monkeypatch):
+        """GeoJSON pages keep GDAL's default polygon organization."""
+        import os
+
+        from geoparquet_io.core import arcgis
+
+        monkeypatch.delenv("OGR_ORGANIZE_POLYGONS", raising=False)
+        arcgis._geojson_page_to_table(MOCK_FEATURES_PAGE["features"])
+        assert "OGR_ORGANIZE_POLYGONS" not in os.environ
+
     @patch("geoparquet_io.core.arcgis.fetch_all_features")
     def test_stream_features_to_parquet_single_page(self, mock_fetch, output_file):
         """Test streaming a single page to parquet."""

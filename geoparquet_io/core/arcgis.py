@@ -170,6 +170,25 @@ def _gdal_geojson_size_limit_lifted():
             os.environ["OGR_GEOJSON_MAX_OBJ_SIZE"] = previous
 
 
+@contextmanager
+def _gdal_organize_polygons(mode: str):
+    """Set GDAL's ``OGR_ORGANIZE_POLYGONS`` for the duration of a read.
+
+    ``ONLY_CCW`` skips the expensive ring-containment analysis and trusts ring
+    winding (outer rings one way, holes the other), which is how ArcGIS
+    EsriJSON delivers polygons. Scoped because the variable is process-global.
+    """
+    previous = os.environ.get("OGR_ORGANIZE_POLYGONS")
+    os.environ["OGR_ORGANIZE_POLYGONS"] = mode
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("OGR_ORGANIZE_POLYGONS", None)
+        else:
+            os.environ["OGR_ORGANIZE_POLYGONS"] = previous
+
+
 def _warn_batch_reduced(
     failed_batch: int, offset: int, new_batch: int, reason: str, restart_from: int
 ) -> None:
@@ -1240,7 +1259,9 @@ def _exclude_columns(table: pa.Table, exclude_list: list[str] | None) -> pa.Tabl
     return table.select(cols_to_keep)
 
 
-def _json_doc_to_table(doc: dict, exclude: str, suffix: str, con=None) -> pa.Table:
+def _json_doc_to_table(
+    doc: dict, exclude: str, suffix: str, con=None, organize_polygons: str | None = None
+) -> pa.Table:
     """Write a JSON document to a temp file and convert it via DuckDB ST_Read.
 
     Shared mechanics for the GeoJSON and EsriJSON page converters.
@@ -1252,6 +1273,7 @@ def _json_doc_to_table(doc: dict, exclude: str, suffix: str, con=None) -> pa.Tab
         suffix: Temp file suffix (controls GDAL driver detection)
         con: Optional DuckDB connection to reuse across pages; a fresh one is
             created and closed when omitted.
+        organize_polygons: Optional OGR_ORGANIZE_POLYGONS value for the read.
 
     Returns:
         PyArrow Table with WKB geometry column
@@ -1275,7 +1297,10 @@ def _json_doc_to_table(doc: dict, exclude: str, suffix: str, con=None) -> pa.Tab
         # Allow arbitrarily large/complex single features through GDAL's parser
         # (issue #517) — must be in effect while ST_Read reads the temp file.
         with _gdal_geojson_size_limit_lifted():
-            return con.execute(query).arrow().read_all()
+            if organize_polygons is None:
+                return con.execute(query).arrow().read_all()
+            with _gdal_organize_polygons(organize_polygons):
+                return con.execute(query).arrow().read_all()
 
     finally:
         if owns_con:
@@ -1348,7 +1373,11 @@ def _esrijson_page_to_table(page: dict, con=None) -> pa.Table | None:
         return None
 
     return _json_doc_to_table(
-        _prepare_esrijson_for_gdal(page), exclude="geom", suffix=".json", con=con
+        _prepare_esrijson_for_gdal(page),
+        exclude="geom",
+        suffix=".json",
+        con=con,
+        organize_polygons="ONLY_CCW",
     )
 
 
