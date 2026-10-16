@@ -12,7 +12,7 @@ import os
 import tempfile
 import uuid
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1259,9 +1259,7 @@ def _exclude_columns(table: pa.Table, exclude_list: list[str] | None) -> pa.Tabl
     return table.select(cols_to_keep)
 
 
-def _json_doc_to_table(
-    doc: dict, exclude: str, suffix: str, con=None, organize_polygons: str | None = None
-) -> pa.Table:
+def _json_doc_to_table(doc: dict, exclude: str, suffix: str, con=None) -> pa.Table:
     """Write a JSON document to a temp file and convert it via DuckDB ST_Read.
 
     Shared mechanics for the GeoJSON and EsriJSON page converters.
@@ -1273,7 +1271,6 @@ def _json_doc_to_table(
         suffix: Temp file suffix (controls GDAL driver detection)
         con: Optional DuckDB connection to reuse across pages; a fresh one is
             created and closed when omitted.
-        organize_polygons: Optional OGR_ORGANIZE_POLYGONS value for the read.
 
     Returns:
         PyArrow Table with WKB geometry column
@@ -1297,10 +1294,7 @@ def _json_doc_to_table(
         # Allow arbitrarily large/complex single features through GDAL's parser
         # (issue #517) — must be in effect while ST_Read reads the temp file.
         with _gdal_geojson_size_limit_lifted():
-            if organize_polygons is None:
-                return con.execute(query).arrow().read_all()
-            with _gdal_organize_polygons(organize_polygons):
-                return con.execute(query).arrow().read_all()
+            return con.execute(query).arrow().read_all()
 
     finally:
         if owns_con:
@@ -1377,7 +1371,6 @@ def _esrijson_page_to_table(page: dict, con=None) -> pa.Table | None:
         exclude="geom",
         suffix=".json",
         con=con,
-        organize_polygons="ONLY_CCW",
     )
 
 
@@ -1438,6 +1431,12 @@ def _stream_features_to_parquet(
 
     # One DuckDB connection for all page conversions (a fresh connection per
     # page would re-load the spatial extension thousands of times)
+    # GDAL reads OGR_ORGANIZE_POLYGONS once and caches it, so for EsriJSON it must
+    # be set before the spatial extension is loaded and first used; setting it
+    # around each read has no effect.
+    env_scope = ExitStack()
+    if output_wkid is not None:
+        env_scope.enter_context(_gdal_organize_polygons("ONLY_CCW"))
     con = get_duckdb_connection(load_spatial=True, load_httpfs=False)
 
     try:
@@ -1520,6 +1519,7 @@ def _stream_features_to_parquet(
 
     finally:
         con.close()
+        env_scope.close()
         if writer is not None:
             writer.close()
 

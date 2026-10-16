@@ -1467,14 +1467,32 @@ class TestStreamingConversion:
             "the GDAL size limit leaked out of the page conversion"
         )
 
-    def test_esrijson_page_uses_only_ccw_scoped(self, monkeypatch):
-        """ESRIJSON reads set OGR_ORGANIZE_POLYGONS=ONLY_CCW, restored afterwards."""
+    def test_esrijson_stream_sets_only_ccw_before_spatial_load(self, monkeypatch):
+        """The stream sets ONLY_CCW before the connection loads spatial, restores after."""
         import os
 
         from geoparquet_io.core import arcgis
 
         monkeypatch.delenv("OGR_ORGANIZE_POLYGONS", raising=False)
-        arcgis._esrijson_page_to_table(MOCK_ESRI_FEATURES_PAGE)
+        seen = {}
+        real = arcgis.get_duckdb_connection
+
+        def spy(*a, **k):
+            seen["env"] = os.environ.get("OGR_ORGANIZE_POLYGONS")
+            return real(*a, **k)
+
+        monkeypatch.setattr(arcgis, "get_duckdb_connection", spy)
+        info = arcgis.ArcGISLayerInfo(
+            name="x",
+            geometry_type="esriGeometryPolygon",
+            spatial_reference={"wkid": 4326},
+            fields=[],
+            max_record_count=1000,
+            total_count=0,
+        )
+        with patch.object(arcgis, "fetch_all_features", return_value=iter([])):
+            arcgis._stream_features_to_parquet("http://x", info, "unused.parquet", output_wkid=4326)
+        assert seen["env"] == "ONLY_CCW"
         assert "OGR_ORGANIZE_POLYGONS" not in os.environ
 
         monkeypatch.setenv("OGR_ORGANIZE_POLYGONS", "DEFAULT")
@@ -1482,15 +1500,32 @@ class TestStreamingConversion:
             assert os.environ["OGR_ORGANIZE_POLYGONS"] == "ONLY_CCW"
         assert os.environ["OGR_ORGANIZE_POLYGONS"] == "DEFAULT"
 
-    def test_geojson_page_does_not_set_organize_polygons(self, monkeypatch):
-        """GeoJSON pages keep GDAL's default polygon organization."""
+    def test_geojson_stream_does_not_set_organize_polygons(self, monkeypatch):
+        """GeoJSON streams keep GDAL's default polygon organization."""
         import os
 
         from geoparquet_io.core import arcgis
 
         monkeypatch.delenv("OGR_ORGANIZE_POLYGONS", raising=False)
-        arcgis._geojson_page_to_table(MOCK_FEATURES_PAGE["features"])
-        assert "OGR_ORGANIZE_POLYGONS" not in os.environ
+        seen = {}
+        real = arcgis.get_duckdb_connection
+
+        def spy(*a, **k):
+            seen["env"] = os.environ.get("OGR_ORGANIZE_POLYGONS")
+            return real(*a, **k)
+
+        monkeypatch.setattr(arcgis, "get_duckdb_connection", spy)
+        info = arcgis.ArcGISLayerInfo(
+            name="x",
+            geometry_type="esriGeometryPolygon",
+            spatial_reference={"wkid": 4326},
+            fields=[],
+            max_record_count=1000,
+            total_count=0,
+        )
+        with patch.object(arcgis, "fetch_all_features", return_value=iter([])):
+            arcgis._stream_features_to_parquet("http://x", info, "unused.parquet")
+        assert seen["env"] is None
 
     @patch("geoparquet_io.core.arcgis.fetch_all_features")
     def test_stream_features_to_parquet_single_page(self, mock_fetch, output_file):
