@@ -31,6 +31,7 @@ from geoparquet_io.core.crs_utils import apply_output_crs
 from geoparquet_io.core.duckdb_utils import _wrap_query_with_wkb_conversion, quote_identifier
 from geoparquet_io.core.geo_metadata import (
     GEOPARQUET_VERSIONS,
+    NATIVE_GEOMETRY_VERSIONS,
     bbox_column_to_declare,
     compute_geo_stats_via_sql,
     create_geo_metadata,
@@ -44,7 +45,10 @@ from geoparquet_io.core.geoarrow_encoding import (
     wkb_array_to_geoarrow,
 )
 from geoparquet_io.core.logging_config import configure_verbose, debug, progress, success
-from geoparquet_io.core.parquet_writer import apply_output_kv_metadata
+from geoparquet_io.core.parquet_writer import (
+    apply_output_kv_metadata,
+    without_geometry_dictionary,
+)
 from geoparquet_io.core.write_strategies.base import (
     BaseWriteStrategy,
     _parse_existing_geo_metadata,
@@ -303,7 +307,7 @@ class ArrowStreamingStrategy(BaseWriteStrategy):
         _, final_sql = _check_geometry_type(con, query, geometry_column, verbose)
 
         # Determine version flags
-        use_native_geometry = geoparquet_version in ("2.0", "parquet-geo-only")
+        use_native_geometry = geoparquet_version in NATIVE_GEOMETRY_VERSIONS
         should_add_geo_metadata = geoparquet_version != "parquet-geo-only"
         geoarrow_native = geoparquet_version == "1.1-geoarrow"
 
@@ -539,6 +543,9 @@ class ArrowStreamingStrategy(BaseWriteStrategy):
             col_index = schema_with_meta.get_field_index(geometry_column)
             geoarrow_type = schema_with_meta.field(col_index).type
 
+        writer_kwargs = without_geometry_dictionary(
+            writer_kwargs, schema_with_meta, geometry_columns or {geometry_column}
+        )
         rows_written, batches_written = self._write_all_batches(
             output_path,
             schema_with_meta,
@@ -581,6 +588,9 @@ class ArrowStreamingStrategy(BaseWriteStrategy):
             extra_kv_metadata=extra_kv_metadata,
             geoarrow_target_type=geoarrow_target_type,
             geometry_columns=geometry_columns,
+        )
+        writer_kwargs = without_geometry_dictionary(
+            writer_kwargs, schema_with_meta, geometry_columns or {geometry_column}
         )
         with pq.ParquetWriter(output_path, schema_with_meta, **writer_kwargs):
             pass
@@ -691,6 +701,10 @@ class ArrowStreamingStrategy(BaseWriteStrategy):
         # parquet-geo-only request (#773). `_build_streaming_schema` starts from
         # this table's metadata, so the same call covers the geometry path,
         # where a parquet-geo-only write used to keep the input's block too.
+        # Read before the facade below, which drops `geo` under parquet-geo-only.
+        # It is still the witness for which columns are geometry, and without it
+        # a secondary lost its native type and kept its dictionary (#1122).
+        carried_geo = _parse_geo_metadata_quietly(table.schema.metadata)
         table = apply_output_kv_metadata(table, geoparquet_version, extra_kv_metadata)
 
         validated_compression, validated_level, _ = validate_compression_settings(
@@ -720,9 +734,7 @@ class ArrowStreamingStrategy(BaseWriteStrategy):
         # what names a block-less table's secondaries (#1175). Below 2.0 they also
         # have to give up the GeoArrow carrier the schema builder would otherwise
         # write as a native Parquet GEOMETRY type -- illegal in a 1.x file.
-        geometry_info = table_geometry_info(
-            table, geometry_column, _parse_geo_metadata_quietly(table.schema.metadata)
-        )
+        geometry_info = table_geometry_info(table, geometry_column, carried_geo)
         if geometry_info and effective_version in ("1.0", "1.1"):
             table = _canonicalize_wkb_columns(
                 table,
@@ -731,7 +743,7 @@ class ArrowStreamingStrategy(BaseWriteStrategy):
                 native_columns={geometry_column},
             )
 
-        use_native_geometry = effective_version in ("2.0", "parquet-geo-only")
+        use_native_geometry = effective_version in NATIVE_GEOMETRY_VERSIONS
         should_add_geo_metadata = effective_version != "parquet-geo-only"
         geoarrow_native = effective_version == "1.1-geoarrow"
 
@@ -809,6 +821,7 @@ class ArrowStreamingStrategy(BaseWriteStrategy):
         native_crs = native_geometry_crs(
             effective_version, geo_meta, geometry_column, geometry_info
         )
+        geometry_columns = set(geo_meta["columns"])
         if not should_add_geo_metadata:
             geo_meta = None
 
@@ -822,11 +835,17 @@ class ArrowStreamingStrategy(BaseWriteStrategy):
             verbose=verbose,
             extra_kv_metadata=extra_kv_metadata,
             geoarrow_target_type=geoarrow_target_type,
+            # parquet-geo-only has set `geo_meta` to None by now, so the
+            # secondaries are named here or not at all.
+            geometry_columns=geometry_columns,
         )
 
         writer_kwargs = {"compression": validated_compression or "NONE"}
         if validated_level is not None and validated_compression:
             writer_kwargs["compression_level"] = validated_level
+        writer_kwargs = without_geometry_dictionary(
+            writer_kwargs, schema_with_meta, geometry_columns
+        )
 
         geoarrow_type = None
         if use_native_geometry:

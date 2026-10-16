@@ -12,10 +12,16 @@ from dataclasses import dataclass
 
 import duckdb
 
-from geoparquet_io.core.duckdb_utils import _geoarrow_coord_exprs, quote_identifier, sql_path
+from geoparquet_io.core.duckdb_utils import (
+    _geoarrow_coord_exprs,
+    quote_identifier,
+    register_arrow,
+    sql_path,
+)
 from geoparquet_io.core.file_utils import resolve_file_url
 from geoparquet_io.core.geo_metadata import carried_column_name
 from geoparquet_io.core.logging_config import debug
+from geoparquet_io.core.optional_deps import load_module
 from geoparquet_io.core.remote import needs_httpfs
 
 # Standard geometry column names for fallback detection
@@ -199,7 +205,7 @@ def native_geometry_types_from_query(con, query: str, verbose: bool = False) -> 
     witness prefers it.
 
     DuckDB has no ``GEOGRAPHY`` type, so this source can never report ``edges``;
-    those travel separately, through ``write_funnels._preserve_edges_after_write``.
+    those travel separately, through ``write_funnels.apply_nonplanar_edges``.
 
     Best-effort: a ``DESCRIBE`` that fails answers ``{}`` rather than failing the
     write.
@@ -332,15 +338,21 @@ class GeometryRead:
     parse (#1064). ``expr`` maps both to NULL and ``present_sql`` excludes them,
     so a check reads the other rows instead of dying on them. Only an encoding
     check goes looking for them, through ``empty_sql`` and ``unparsable_sql``.
+
+    ``flat`` says the column reaches SQL as flat vectors, as a registered
+    non-dictionary Arrow column does. The ``list_extract`` guard against
+    dictionary vectors (see ``parseable_sql``) copies every value, which over
+    a whole geometry column is a second copy of it, so a flat read skips it.
     """
 
     column: str
     kind: str
     duckdb_type: str = ""
+    flat: bool = False
 
     @classmethod
-    def for_type(cls, column: str, duckdb_type: str | None) -> GeometryRead:
-        return cls(column, _read_kind(duckdb_type), duckdb_type or "")
+    def for_type(cls, column: str, duckdb_type: str | None, *, flat: bool = False) -> GeometryRead:
+        return cls(column, _read_kind(duckdb_type), duckdb_type or "", flat)
 
     @property
     def readable(self) -> bool:
@@ -357,6 +369,9 @@ class GeometryRead:
         For a GeoArrow column this is a representative point, the centre of the
         value's coordinate extent, which is what a distance-based reader needs.
         """
+        if self.kind == "wkb" and self.flat:
+            q = self.quoted
+            return f"(CASE WHEN octet_length({q}) > 0 THEN TRY(ST_GeomFromWKB({q})) END)"
         if self.kind == "wkb":
             # CASE, not a WHERE conjunct, so no evaluation order can hand a bad
             # value to ST_GeomFromWKB. The THEN branch reads a flat vector as
@@ -367,6 +382,17 @@ class GeometryRead:
         if self.kind == "geoarrow":
             return self._geoarrow_point_expr()
         return self.quoted
+
+    @property
+    def shape_expr(self) -> str:
+        """SQL for the whole value as GEOMETRY, never a representative point.
+
+        ``expr`` for a native or WKB column. Any other column is handed over
+        bare, so a function that needs a real shape (a bbox, a sort key, a
+        validity check) fails on it as it always did rather than reading the
+        GeoArrow centre point ``expr`` gives.
+        """
+        return self.expr if self.kind in ("native", "wkb") else self.quoted
 
     @property
     def present_sql(self) -> str:
@@ -387,6 +413,8 @@ class GeometryRead:
         if self.kind != "wkb":
             return "TRUE"
         q = self.quoted
+        if self.flat:
+            return f"(octet_length({q}) > 0 AND TRY(ST_GeomFromWKB({q})) IS NOT NULL)"
         return (
             f"(octet_length({q}) > 0 AND TRY(ST_GeomFromWKB(list_extract([{q}], 1))) IS NOT NULL)"
         )
@@ -457,6 +485,36 @@ def resolve_geometry_read(con, raw_url: str, column: str) -> GeometryRead:
     """
     described = con.execute(f"DESCRIBE SELECT * FROM read_parquet({sql_path(raw_url)})").fetchall()
     return GeometryRead.for_type(column, _find_described_type(described, column))
+
+
+def register_geometry_column(
+    con, name: str, table, column: str, *, row_index: str | None = None
+) -> GeometryRead:
+    """Register only ``column`` of the Arrow ``table`` on ``con`` as ``name``.
+
+    The one way a table-centric helper hands geometry to DuckDB (#1268): the
+    other columns never cross, so nothing but the geometry is scanned and the
+    caller's table is never rebuilt from a DuckDB result. Registration is
+    zero-copy. With ``row_index``, an int64 column of that name numbering the
+    rows from 0 is registered beside it, for a caller that wants positions
+    back. A dictionary-typed column is decoded first, so the reader can use
+    the flat-vector WKB parse (see ``GeometryRead.flat``).
+
+    Returns how SQL reads the registered column.
+    """
+    np = load_module("numpy")
+    import pyarrow as pa
+
+    geometry = table.column(column)
+    if pa.types.is_dictionary(geometry.type):
+        geometry = geometry.cast(geometry.type.value_type)
+    columns = {}
+    if row_index is not None:
+        columns[row_index] = pa.array(np.arange(table.num_rows, dtype=np.int64))
+    columns[column] = geometry
+    register_arrow(con, name, pa.table(columns))
+    described = con.execute(f"DESCRIBE {quote_identifier(name)}").fetchall()
+    return GeometryRead.for_type(column, _find_described_type(described, column), flat=True)
 
 
 def count_geometry_presence(

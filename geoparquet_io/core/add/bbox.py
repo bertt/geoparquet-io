@@ -25,7 +25,9 @@ from geoparquet_io.core.geo_metadata import (
 from geoparquet_io.core.geometry_detection import (
     STANDARD_GEOMETRY_NAMES,
     find_primary_geometry_column,
+    register_geometry_column,
 )
+from geoparquet_io.core.geometry_repair import warn_planar_math, warn_planar_math_for_file
 from geoparquet_io.core.logging_config import debug, progress, success, warn
 from geoparquet_io.core.partition.reader import require_single_file
 from geoparquet_io.core.stream_io import open_input, write_output
@@ -151,59 +153,30 @@ def add_bbox_table(
 
     table, bbox_column_name = _prepare_table_bbox_column(table, bbox_column_name)
 
-    # Register table and execute query
+    # Register only the geometry column: registration is zero-copy, and DuckDB
+    # computes nothing but the bbox struct — 32 bytes a row. Round-tripping the
+    # whole table (every attribute plus an ST_AsWKB re-encode of the geometry)
+    # materialized a second full copy of the data for four doubles of new
+    # information (#1268), and re-ordered the columns while doing it.
     con = get_duckdb_connection(load_spatial=True, load_httpfs=False)
     try:
-        con.register("__input_table", table)
-
-        # Check if geometry column is BLOB (needs conversion)
-        columns_info = con.execute("DESCRIBE __input_table").fetchall()
-        geom_is_blob = any(col[0] == geom_col and "BLOB" in col[1].upper() for col in columns_info)
-
-        quoted_geom_col = quote_identifier(geom_col)
+        warn_planar_math("add_bbox", table, geom_col)
+        read = register_geometry_column(con, "__input_table", table, geom_col)
         quoted_bbox_col = quote_identifier(bbox_column_name)
+        bbox_query = f"""
+            SELECT STRUCT_PACK(
+                xmin := ST_XMin(__g),
+                ymin := ST_YMin(__g),
+                xmax := ST_XMax(__g),
+                ymax := ST_YMax(__g)
+            ) AS {quoted_bbox_col}
+            FROM (SELECT {read.shape_expr} AS __g FROM __input_table)
+        """
+        bbox_column = con.execute(bbox_query).arrow().read_all().column(0)
 
-        if geom_is_blob and geom_col in table.column_names:
-            # Create view with geometry conversion
-            # Quote column names to handle special characters (colons, spaces,
-            # embedded quotes, etc.)
-            other_cols = [quote_identifier(c) for c in table.column_names if c != geom_col]
-            col_defs = other_cols + [f"ST_GeomFromWKB({quoted_geom_col}) AS {quoted_geom_col}"]
-            view_query = (
-                f"CREATE VIEW __input_view AS SELECT {', '.join(col_defs)} FROM __input_table"
-            )
-            con.execute(view_query)
-            source_ref = "__input_view"
-        else:
-            source_ref = "__input_table"
-
-        # Build query to add bbox column
-        bbox_expr = f"""STRUCT_PACK(
-            xmin := ST_XMin({quoted_geom_col}),
-            ymin := ST_YMin({quoted_geom_col}),
-            xmax := ST_XMax({quoted_geom_col}),
-            ymax := ST_YMax({quoted_geom_col})
-        )"""
-
-        # Get non-geometry columns
-        other_cols = [quote_identifier(c) for c in table.column_names if c != geom_col]
-        select_cols = ", ".join(other_cols) if other_cols else ""
-
-        # Build SELECT with geometry converted back to WKB
-        if select_cols:
-            query = f"""
-                SELECT {select_cols},
-                       ST_AsWKB({quoted_geom_col}) AS {quoted_geom_col},
-                       {bbox_expr} AS {quoted_bbox_col}
-                FROM {source_ref}
-            """
-        else:
-            query = f"""
-                SELECT ST_AsWKB({quoted_geom_col}) AS {quoted_geom_col},
-                       {bbox_expr} AS {quoted_bbox_col}
-                FROM {source_ref}
-            """
-        result = con.execute(query).arrow().read_all()
+        # Append the computed column; everything else keeps its exact bytes,
+        # Arrow types and column order.
+        result = table.append_column(bbox_column_name, bbox_column)
 
         # Preserve metadata, recording the column just computed as the
         # geometry's covering bbox (see _declare_computed_bbox).
@@ -435,6 +408,8 @@ def add_bbox_column(
         compression, compression_level, row_group_size_mb, row_group_rows, geoparquet_version
     )
     compression = compression or "ZSTD"
+
+    warn_planar_math_for_file("add_bbox", input_parquet)
 
     # Check for streaming mode (stdin input or stdout output)
     is_streaming = is_stdin(input_parquet) or should_stream_output(output_parquet)

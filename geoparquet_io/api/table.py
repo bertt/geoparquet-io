@@ -25,6 +25,7 @@ from geoparquet_io.core.add.kdtree import (
     ITERATIONS_MISSING,
 )
 from geoparquet_io.core.add.stac_metadata import DEFAULT_STAC_GEOPARQUET_VERSION
+from geoparquet_io.core.check_bbox_values import DEFAULT_BBOX_SAMPLE_ROWS
 from geoparquet_io.core.check_parquet_structure import CheckProfile
 from geoparquet_io.core.duckdb_utils import quote_identifier
 from geoparquet_io.core.logging_config import warn
@@ -189,12 +190,12 @@ def _calculate_bounds_from_table(
     if table.num_rows == 0:
         return None
 
-    from geoparquet_io.core.duckdb_utils import get_duckdb_connection
+    from geoparquet_io.core.duckdb_utils import get_duckdb_connection, register_arrow
 
     con = None
     try:
         con = get_duckdb_connection(load_spatial=True, load_httpfs=False)
-        con.register("input_table", table)
+        register_arrow(con, "input_table", table)
 
         # Use ST_Extent to get the bounding box of all geometries
         query = f"""
@@ -335,11 +336,7 @@ def read_partition(
         s3_config_scope,
     )
     from geoparquet_io.core.partition.reader import build_read_parquet_expr
-    from geoparquet_io.core.remote import (
-        needs_httpfs,
-        resolve_s3_config,
-        setup_aws_profile_if_needed,
-    )
+    from geoparquet_io.core.remote import needs_httpfs, resolve_s3_config
     from geoparquet_io.core.streaming import find_geometry_column_from_table
 
     s3_config = resolve_s3_config(
@@ -348,9 +345,6 @@ def read_partition(
         s3_no_ssl=not s3_use_ssl,
         aws_profile=aws_profile,
     )
-    if s3_config["profile"]:
-        setup_aws_profile_if_needed(s3_config["profile"], str(path))
-
     path_str = str(path)
     expr = build_read_parquet_expr(
         path_str,
@@ -658,6 +652,10 @@ class Table:
         # different bytes, so its checks are prospective.
         return derived
 
+    def _wrap_geographic(self, table: pa.Table, geometry_column: str | None) -> Table:
+        """Wrap new grid or admin boundaries in their output CRS, not the source CRS."""
+        return self._wrap(table, geometry_column, crs="OGC:CRS84" if geometry_column else None)
+
     def _detect_geometry_column(self) -> str | None:
         """Detect geometry column from metadata or common names."""
         from geoparquet_io.core.streaming import find_geometry_column_from_table
@@ -933,12 +931,21 @@ class Table:
             typename: Feature type name (e.g., 'cities' or 'ns:cities')
             version: WFS version ('auto', '2.0.0', '1.1.0', '1.0.0'). Default 'auto'
                 tries 2.0.0, then 1.1.0, then 1.0.0.
-            bbox: Optional bounding box filter (xmin, ymin, xmax, ymax)
+            bbox: Optional bounding box filter (xmin, ymin, xmax, ymax), x,y, in the
+                CRS requested from the layer (output_crs, else EPSG:4326, else the
+                layer's default CRS). It is not reprojected. When it looks like
+                lon/lat on a projected layer, or matches nothing, a warning prints
+                the box reprojected into the layer CRS as a hint.
             limit: Maximum features to fetch
             max_workers: Parallel requests for large datasets (default: 1)
             page_size: Features per page when using parallel mode (default: 100000)
-            axis_order: Bbox axis order ('auto', 'xy', 'latlon'). 'auto' detects from
-                CRS format - URN CRS with WFS 1.1.0+ uses lat,lon per OGC spec.
+            axis_order: Bbox axis order ('auto', 'xy', 'latlon'). Pass the bbox
+                x,y. 'auto' sends it in the form every server reads alike, CRS84
+                for lon/lat and lat,lon with the EPSG URN for other lat,lon CRSs
+                (EPSG:4258). 'xy' always sends x,y with the short EPSG:<code>
+                label (CRS84 for lon/lat). 'latlon' also sends a lon/lat bbox
+                lat,lon, for servers such as ArcGIS WFS that read every 4326 bbox
+                that way. Ignored on WFS 1.0.0, which reads x,y.
             strict_crs: If True, fail when the server returns a different CRS than
                 requested. If False (default), warn and use the server's actual
                 CRS. The CRS the server declares in its GeoJSON response is
@@ -1487,6 +1494,17 @@ class Table:
                 from geoparquet_io.core.crs_utils import parse_crs_string_to_projjson
 
                 input_crs = parse_crs_string_to_projjson(input_crs)
+            elif input_crs is None:
+                # `self.crs` is None for an unknown CRS and for the default
+                # alike. Unknown has to be said on the way out (`crs: null`,
+                # a `srid:0` type), or it is written as OGC:CRS84 (#1276).
+                from geoparquet_io.core.crs_utils import (
+                    PARQUET_UNKNOWN_CRS,
+                    table_crs_is_unknown,
+                )
+
+                if table_crs_is_unknown(self._table, self._geometry_column):
+                    input_crs = PARQUET_UNKNOWN_CRS
 
             # Carry the table's non-geo file-level KV metadata (fiboa, vecorel,
             # STAC fragments) into the write. The Arrow strategies copied it
@@ -1514,8 +1532,21 @@ class Table:
                 self._table.schema.metadata, self._geometry_column, self._table.column_names
             )
 
+            # DuckDB refuses a GeoArrow column with non-planar edges, and the
+            # strategies rebuild the geo block without them. So the edges are
+            # read off the table, cleared for the write, and restored on the
+            # written file, as the CLI write paths do (#1253).
+            from geoparquet_io.core.arrow_geo_metadata import with_planar_edge_types
+            from geoparquet_io.core.write_funnels import (
+                apply_nonplanar_edges,
+                table_nonplanar_edges,
+            )
+
+            edges_by_col = table_nonplanar_edges(self._table, self._geometry_column, None)
+            write_table = with_planar_edge_types(self._table)
+
             strategy.write_from_table(
-                table=self._table,
+                table=write_table,
                 output_path=str(local_path),
                 geometry_column=self._geometry_column,
                 geoparquet_version=geoparquet_version,
@@ -1527,6 +1558,14 @@ class Table:
                 input_crs=input_crs,
                 custom_metadata={"covering": carried_covering} if carried_covering else None,
                 extra_kv_metadata=preserved_kv or None,
+            )
+            apply_nonplanar_edges(
+                edges_by_col,
+                str(local_path),
+                compression=compression,
+                compression_level=compression_level,
+                row_group_rows=row_group_rows,
+                verbose=verbose,
             )
 
             # Upload to remote if needed
@@ -2006,7 +2045,7 @@ class Table:
             breakdown_metric=breakdown_metric,
             memory_limit=memory_limit,
         )
-        return self._wrap(result, "geometry" if out_geometry != "none" else None)
+        return self._wrap_geographic(result, "geometry" if out_geometry != "none" else None)
 
     def aggregate_h3(
         self,
@@ -2064,7 +2103,7 @@ class Table:
             breakdown_metric=breakdown_metric,
             memory_limit=memory_limit,
         )
-        return self._wrap(result, "geometry" if out_geometry != "none" else None)
+        return self._wrap_geographic(result, "geometry" if out_geometry != "none" else None)
 
     def aggregate_admin(
         self,
@@ -2121,7 +2160,7 @@ class Table:
             breakdown_metric=breakdown_metric,
             memory_limit=memory_limit,
         )
-        return self._wrap(result, "geometry" if out_geometry != "none" else None)
+        return self._wrap_geographic(result, "geometry" if out_geometry != "none" else None)
 
     def overview(
         self,
@@ -2160,7 +2199,7 @@ class Table:
             memory_limit=memory_limit,
         )
         has_geometry = "geometry" in result.column_names
-        return self._wrap(result, "geometry" if has_geometry else None)
+        return self._wrap_geographic(result, "geometry" if has_geometry else None)
 
     def add_s2(
         self,
@@ -2827,6 +2866,7 @@ class Table:
             fetch_row,
             get_duckdb_connection,
             is_interrupt,
+            register_arrow,
         )
         from geoparquet_io.core.inspect_utils import compute_column_stats
         from geoparquet_io.core.logging_config import debug
@@ -2834,7 +2874,7 @@ class Table:
         con = None
         try:
             con = get_duckdb_connection(load_spatial=True, load_httpfs=False)
-            con.register("input_table", self._table)
+            register_arrow(con, "input_table", self._table)
 
             regular_cols = [f.name for f in self._table.schema if f.name != self._geometry_column]
             stats = {}
@@ -3119,12 +3159,18 @@ class Table:
 
     def check(self) -> CheckResult:
         """
-        Run all best-practice checks on the table.
+        Run the structure checks on the table.
 
         Checks include:
         - Row group optimization
-        - Bbox structure and metadata
+        - Bbox structure and metadata, and the covering
         - Compression settings
+        - Bloom filters
+
+        Not spatial order or spec validation, which ``gpio check all`` also
+        runs: ``check().verdict()`` can be ``"warning"`` for a file ``check
+        all`` fails. For ``check all``'s answer, take the worst of this,
+        :meth:`check_spatial` and :meth:`validate`.
 
         Measured on the source file when this Table was read from one; see
         ``CheckResult.prospective``.
@@ -3134,12 +3180,10 @@ class Table:
 
         Example:
             >>> table = gpio.read('data.parquet')
-            >>> result = table.check()
-            >>> if result.passed():
-            ...     print("All checks passed!")
-            >>> else:
-            ...     for failure in result.failures():
-            ...         print(failure)
+            >>> results = [table.check(), table.check_spatial(), table.validate()]
+            >>> if any(r.verdict() == "failure" for r in results):
+            ...     for r in results:
+            ...         print(*r.failures(), sep="\n")
         """
         from geoparquet_io.core.check_parquet_structure import check_all
 
@@ -3233,16 +3277,34 @@ class Table:
             "compression", check_compression, verbose=False, return_results=True, quiet=True
         )
 
-    def check_bbox(self) -> CheckResult:
+    def check_bbox(
+        self,
+        sample_rows: int = DEFAULT_BBOX_SAMPLE_ROWS,
+        all_rows: bool = False,
+    ) -> CheckResult:
         """
-        Check bbox structure and metadata.
+        Check bbox structure, metadata, and whether the values cover the geometry.
 
         Verifies:
         - Bbox column exists and has correct structure
         - GeoParquet covering metadata is present
+        - A declared covering has a ``bbox`` member readers can use
+        - Each row's bbox actually contains that row's geometry
+
+        The same checks, and verdict, as ``gpio check bbox``. A bbox smaller
+        than its geometry fails the check: readers prune on the covering, so
+        such rows go missing from spatial query results with no error anywhere.
+        A bbox larger than its geometry is reported as a warning only -- readers
+        over-fetch, but the answer stays correct.
 
         Measured on the source file when this Table was read from one; see
         ``CheckResult.prospective``.
+
+        Args:
+            sample_rows: Rows compared against their geometry, mirroring
+                ``gpio check bbox --sample-rows``. 0 skips that comparison and
+                checks structure and metadata only.
+            all_rows: Compare every row, mirroring ``--all-rows``
 
         Returns:
             CheckResult with bbox analysis
@@ -3253,10 +3315,16 @@ class Table:
             >>> if not result.passed():
             ...     table = table.add_bbox()
         """
-        from geoparquet_io.core.check_parquet_structure import check_metadata_and_bbox
+        from geoparquet_io.core.check_parquet_structure import check_bbox
 
         return self._run_check(
-            "bbox", check_metadata_and_bbox, verbose=False, return_results=True, quiet=True
+            "bbox",
+            check_bbox,
+            verbose=False,
+            return_results=True,
+            quiet=True,
+            verify_rows=sample_rows,
+            all_rows=all_rows,
         )
 
     def check_row_groups(self, profile: CheckProfile | None = None) -> CheckResult:
@@ -3370,8 +3438,13 @@ class Table:
         )
 
         # Convert ValidationResult to dict for CheckResult
+        from geoparquet_io.core.check_verdict import SEVERITY_KEY, validation_verdict
+
         results = {
             "passed": validation_result.is_valid,
+            SEVERITY_KEY: validation_verdict(
+                failed=validation_result.failed_count, warnings=validation_result.warning_count
+            ).label,
             "file_path": validation_result.file_path,
             "detected_version": validation_result.detected_version,
             "target_version": validation_result.target_version,

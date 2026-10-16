@@ -20,7 +20,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from geoparquet_io.core.arrow_geo_metadata import (
-    _CARRIED_SCHEMA_METADATA_KEYS_BYTES,
     _detect_version_from_table,
     _parse_geo_metadata_quietly,
     table_geometry_info,
@@ -31,6 +30,7 @@ from geoparquet_io.core.duckdb_utils import (
     _wrap_query_with_wkb_conversion,
     get_duckdb_connection,
     quote_identifier,
+    register_arrow,
     sql_path,
 )
 from geoparquet_io.core.geo_metadata import (
@@ -42,7 +42,7 @@ from geoparquet_io.core.geo_metadata import (
 from geoparquet_io.core.geoarrow_encoding import arrow_extension_name, native_wkb_type
 from geoparquet_io.core.logging_config import configure_verbose, debug, progress, success
 from geoparquet_io.core.memory_limits import scoped_write_memory_limit
-from geoparquet_io.core.parquet_writer import apply_output_kv_metadata
+from geoparquet_io.core.parquet_writer import apply_output_kv_metadata, output_schema_metadata
 from geoparquet_io.core.remote import is_remote_url, upload_if_remote
 from geoparquet_io.core.write_strategies.arrow_streaming import to_geoarrow_column
 from geoparquet_io.core.write_strategies.base import (
@@ -315,6 +315,10 @@ class DiskRewriteStrategy(BaseWriteStrategy):
         # runs before the non-geo early return below -- which is exactly the
         # return that wrote a carried `geo` key through under an explicit
         # parquet-geo-only request (#773).
+        # Read before the facade below, which drops `geo` under parquet-geo-only.
+        # It is still the witness for which columns are geometry, and without it
+        # a secondary lost its native type and kept its dictionary (#1122).
+        carried_geo = _parse_geo_metadata_quietly(table.schema.metadata)
         table = apply_output_kv_metadata(table, geoparquet_version, extra_kv_metadata)
 
         # Handle non-geo tables: write plain Parquet without geo metadata
@@ -338,7 +342,7 @@ class DiskRewriteStrategy(BaseWriteStrategy):
 
         con = get_duckdb_connection(load_httpfs=False)
         try:
-            con.register("input_table", table)
+            register_arrow(con, "input_table", table)
 
             # Convert WKB bytes to GEOMETRY for proper spatial processing.
             # A geoarrow.wkb column already registers as GEOMETRY, and
@@ -370,11 +374,7 @@ class DiskRewriteStrategy(BaseWriteStrategy):
                 extra_kv_metadata=extra_kv_metadata,
                 # This entry point gets no `geometry_info`, so the table's own
                 # schema is what names a block-less table's secondaries (#1175).
-                geometry_info=table_geometry_info(
-                    table,
-                    geometry_column,
-                    _parse_geo_metadata_quietly(table.schema.metadata),
-                ),
+                geometry_info=table_geometry_info(table, geometry_column, carried_geo),
             )
         finally:
             con.close()
@@ -561,23 +561,18 @@ class DiskRewriteStrategy(BaseWriteStrategy):
 
         schema = _native_geometry_schema(pf.schema_arrow, native_crs)
 
-        new_meta = dict(schema.metadata or {})
+        # The facade's rule, as on every other Arrow-side write: no serialized
+        # descriptor of the input's schema, and under parquet-geo-only (no
+        # `geo_meta`) no `geo` key either. A built block replaces the carried one
+        # before the merge, so the caller's extras still have the last word.
+        metadata = dict(schema.metadata or {})
         if geo_meta is not None:
-            new_meta[b"geo"] = json.dumps(geo_meta).encode("utf-8")
-        else:
-            # parquet-geo-only: no `geo` key, and no serialized descriptor of the
-            # input's schema either -- the same exclusion set the other write
-            # paths use (`_strip_geo_metadata_key`).
-            new_meta = {
-                key: value
-                for key, value in new_meta.items()
-                if key not in _CARRIED_SCHEMA_METADATA_KEYS_BYTES
-            }
-        if extra_kv_metadata:
-            for key, value in extra_kv_metadata.items():
-                bkey = key.encode("utf-8") if isinstance(key, str) else key
-                bval = value.encode("utf-8") if isinstance(value, str) else value
-                new_meta[bkey] = bval
+            metadata[b"geo"] = json.dumps(geo_meta).encode("utf-8")
+        new_meta = output_schema_metadata(
+            metadata,
+            None if geo_meta is not None else "parquet-geo-only",
+            extra_kv_metadata,
+        )
         new_schema = schema.with_metadata(new_meta)
 
         if verbose:
@@ -589,6 +584,14 @@ class DiskRewriteStrategy(BaseWriteStrategy):
         }
         if compression_level is not None and pa_compression:
             writer_kwargs["compression_level"] = compression_level
+        # Imported here, not at the top, to keep this hunk clear of the module's
+        # import block (#1281 edits that line).
+        from geoparquet_io.core.parquet_writer import without_geometry_dictionary
+
+        # parquet-geo-only has no block, so `native_crs` is what names its columns.
+        writer_kwargs = without_geometry_dictionary(
+            writer_kwargs, new_schema, set((geo_meta or {}).get("columns") or native_crs)
+        )
 
         num_source_groups = pf.metadata.num_row_groups
 

@@ -192,7 +192,14 @@ Filter features by a rectangular bounding box. The bbox is specified as `xmin,ym
       fixed a row — `ST_MakeValid` can change a geometry's type, so a repaired
       self-intersecting `Polygon` comes back a `MultiPolygon` and the input's
       `geometry_types` would under-declare the output. A repair pass that found
-      nothing invalid changes no row and keeps the carried stats.
+      nothing invalid changes no row and keeps the carried stats. A column that
+      declares **non-planar edges** (`edges: spherical` in the `geo` metadata or
+      a native `GEOGRAPHY` logical type) is never planar-repaired at all: planar
+      validity is the wrong test there, and `ST_MakeValid` would collapse shapes
+      that are valid on the sphere (a pole-enclosing ring, say) into line
+      fragments. The repair and its invalid count are skipped with a warning —
+      even when repair is requested explicitly — and the carried stats and
+      `orientation` stay.
     - **`--exclude-cols`** — metadata that references a dropped column is
       pruned: excluding the `bbox` column drops the `covering` entry, and
       excluding the geometry column writes plain Parquet with no `geo` metadata
@@ -200,6 +207,13 @@ Filter features by a rectangular bounding box. The bbox is specified as `xmin,ym
 
     An unfiltered, unrepaired, single-file column-only extract preserves the
     input's `bbox`/`geometry_types` unchanged.
+
+    Arrow IPC pipes also keep each geometry column's CRS and edge interpolation,
+    including native `GEOGRAPHY` inputs with no `geo` key. A receiving extract
+    sees the spherical declaration before its repair decision, so passing data
+    through another command does not enable planar repair. See
+    [native geometry through a pipe](piping.md#native-geometry-through-a-pipe)
+    for CLI and Python examples.
 
     Recomputing costs one extra aggregate pass over the (already filtered)
     query — on the order of 30% of a plain copy for a few million rows. Use
@@ -1465,7 +1479,30 @@ Web Feature Service (WFS) is an OGC standard for serving vector geospatial data 
 
 ### Bbox Filtering
 
-Spatial filtering can be applied server-side (pushed to WFS) or locally (after download):
+Spatial filtering can be applied server-side (pushed to WFS) or locally (after download).
+
+The bbox is read in the CRS gpio requests from the layer. That is `--output-crs`
+when the layer offers it, else EPSG:4326 when the layer offers it, else the
+layer's default CRS. Most layers offer EPSG:4326, so a lon/lat bbox works. For
+a layer that only offers a projected CRS, pass the bbox in that CRS, x,y
+(easting first, or westing first for Krovak). gpio does not reproject it, and
+sends it labelled with that CRS so the server applies the filter. Only when
+the request CRS is geographic WGS84 is the bbox labelled
+`urn:ogc:def:crs:OGC:1.3:CRS84`, which GeoServer, MapServer, QGIS Server and
+deegree all read as lon,lat. For a projected request CRS, gpio reads the bbox
+in that CRS without reprojecting it.
+
+When the bbox looks like lon/lat on a projected layer, or a bbox matches no
+features, gpio warns. The warning names the layer CRS, shows the layer extent
+in lon/lat and in that CRS, and prints your box reprojected into it, ready to
+copy. gpio does not apply the hint. For a layer that only offers EPSG:4026, it
+reads like this.
+
+```text
+--bbox 28.82,47.01,28.825,47.013 looks like lon/lat. --bbox is read in the layer CRS EPSG:4026 (MOLDREF99 / Moldova TM), x,y (easting first).
+Layer extent is 26.63,45.44,30.13,48.47 in lon/lat and 61521,33542,335349,371881 in EPSG:4026.
+If your box is lon/lat, try --bbox 231933,208131,232316,208468 (reprojected to EPSG:4026, not applied).
+```
 
 === "CLI"
     <!-- doctest: skip="illustrative endpoint" -->
@@ -1604,17 +1641,39 @@ a service advertises nothing at all, gpio asks for GeoJSON as it always has.
 
 ### Axis Order
 
-WFS 1.1.0+ with URN-format CRS (e.g., `urn:ogc:def:crs:EPSG::4326`) uses lat,lon axis order per OGC spec. gpio auto-detects this, but you can override:
+Pass `--bbox` as x,y (lon,lat for a geographic layer). gpio then picks the
+order and the label from the layer CRS, so that every server reads the bbox the
+same way.
+
+- A WGS84 lon/lat layer (EPSG:4326, CRS84) gets x,y labelled CRS84.
+- A layer CRS whose official axis order starts with latitude or northing, such
+  as EPSG:4258, EPSG:4269 or EPSG:3006, gets lat,lon (or y,x) labelled
+  `urn:ogc:def:crs:EPSG::<code>`. Servers disagree on the short `EPSG:<code>`
+  label for these CRSs, while they all read the URN in that order.
+- Any other projected layer (EPSG:3857, EPSG:25832, and polar CRSs such as
+  EPSG:3031 or EPSG:3413 that list easting first) gets x,y with its
+  `EPSG:<code>` label.
+- WFS 1.0.0 is always read x,y, so the bbox goes x,y with no label.
+
+Some servers, such as ArcGIS WFS, read every EPSG:4326 bbox as lat,lon whatever
+the label says, so the filter selects a swapped area. For those,
+`--axis-order latlon` sends the bbox as lat,lon with the
+`urn:ogc:def:crs:EPSG::4326` label. It has no effect on an x,y CRS, and on WFS
+1.0.0 it is ignored with a warning.
+
+`--axis-order xy` always sends the bbox x,y with the short `EPSG:<code>` label
+(CRS84 for a lon/lat layer). Use it for a server that reads the short label x,y
+but mishandles the URN for a lat,lon CRS such as EPSG:4258.
 
 <!-- doctest: skip="illustrative endpoint" -->
 ```bash
-# Force lon,lat (XY) axis order
+# Default, x,y order
+gpio extract wfs https://geo.example.com/wfs cities output.parquet \
+    --bbox 4.82,50.44,4.92,50.48
+
+# Send a lon/lat bbox to the server as lat,lon
 gpio extract wfs https://geo.example.com/wfs cities output.parquet \
     --bbox 4.82,50.44,4.92,50.48 \
-    --axis-order xy
-
-# Force lat,lon axis order
-gpio extract wfs https://geo.example.com/wfs cities output.parquet \
     --axis-order latlon
 ```
 
@@ -1759,6 +1818,11 @@ gpio extract carto https://phl.carto.com opa_properties_public output.parquet
 ### Geometry Column
 
 Carto tables typically have geometry in a column named `the_geom` (WGS84). This is automatically renamed to `geometry` in the output for consistency with other geoparquet-io extractors.
+
+Carto returns `the_geom` in the SRID the table stores it in, without reprojecting. So `gpio` reads that SRID with one small `ST_SRID` query and tags the output with it. SRID 4326 is written as `OGC:CRS84`, and any other SRID as its EPSG definition. If the SRID cannot be read, resolves to no EPSG definition, or differs between the rows you extract, the extraction **fails** and writes nothing, because a file tagged as WGS84 would label projected coordinates as longitude and latitude.
+
+!!! note "Changed after 1.6.0"
+    Every Carto extraction used to be tagged `OGC:CRS84`, whatever SRID the table used. A table stored in a projected SRID is now tagged with that SRID, and one whose SRID cannot be resolved is refused.
 
 ### Non-Geometry (Tabular) Tables
 

@@ -34,7 +34,7 @@ The `convert` command transforms between GeoParquet and other vector formats wit
     so the number you ask for is the number that lands.
 
     A request of **2,048 rows or fewer** is the exception: gpio passes it
-    through untouched, because pyarrow honours it exactly while DuckDB's
+    through untouched, because pyarrow honors it exactly while DuckDB's
     `COPY` rounds it up to 2,048 regardless — so what lands depends on which
     writer runs, and gpio cannot snap it without overriding the one writer that
     could have obeyed. `convert` writes through DuckDB, so
@@ -76,6 +76,14 @@ so `gpio convert` stops with `Failed to read input file` and `gpio.convert()`
 raises a `GeoParquetError`. DuckDB 1.5.5 crashed on such files instead, which
 is why gpio requires DuckDB 1.5.6 or later
 ([#1102](https://github.com/geoparquet/geoparquet-io/issues/1102)).
+
+GeoJSON dates and times keep their UTC offset. A property such as
+`2026-01-01T00:00:00+01:00` becomes the instant `2025-12-31 23:00:00` UTC in a
+TIMESTAMP WITH TIME ZONE column, and DATE, TIME and offset-free TIMESTAMP
+columns keep their types. The GDAL that DuckDB spatial 1.5 bundles dropped the
+offset when a whole column shared one, so gpio reads GeoJSON date columns as
+text and lets DuckDB parse them
+([#1152](https://github.com/geoparquet/geoparquet-io/issues/1152)).
 
 The table `gpio.convert()` returns describes its geometry column and CRS the
 same way a table from `gpio.read()` does, so every `add_*` method works on it
@@ -408,7 +416,7 @@ detected. The returned `Table` carries the name actually used, so read it off
 | Source | `geometry_column='geom'` gives |
 |--------|-------------------------------|
 | CSV, or Parquet with WKT / lat-lon columns | `geom` — the geometry is *built* here, so it can take the name. A column the source carries through that already has that name keeps it, and the built one moves aside to `geom_1` with a warning. |
-| GeoPackage, Shapefile, GeoJSON, FlatGeobuf, FileGDB, GeoParquet | `geometry` — the read aliases `ST_AsWKB(...) AS geometry`, so the request cannot be honoured and the actual name is reported instead. This is also why `gpio.convert()` on a `the_geom` GeoParquet hands back `geometry`, where the CLI above keeps the name. |
+| GeoPackage, Shapefile, GeoJSON, FlatGeobuf, FileGDB, GeoParquet | `geometry` — the read aliases `ST_AsWKB(...) AS geometry`, so the request cannot be honored and the actual name is reported instead. This is also why `gpio.convert()` on a `the_geom` GeoParquet hands back `geometry`, where the CLI above keeps the name. |
 
 === "Python"
 
@@ -421,7 +429,7 @@ detected. The returned `Table` carries the name actually used, so read it off
                          geometry_column='geom')
     table.geometry_column   # 'geom'
 
-    # Not honoured: a GeoPackage's geometry is read, and reports back 'geometry'
+    # Not honored: a GeoPackage's geometry is read, and reports back 'geometry'
     table = gpio.convert('data.gpkg', geometry_column='geom')
     table.geometry_column   # 'geometry'
     ```
@@ -460,10 +468,49 @@ declaration unchanged. `gpio check spec` warns about files that carry
     gpio.read('geography.parquet').sort_hilbert().write('output.parquet')
     ```
 
+The same holds for a native Parquet GEOGRAPHY column with no `geo` key, and
+for the commands that write through an Arrow table (`process simplify`, the
+Python API's `.write()`). A 2.0 output keeps the column a GEOGRAPHY, and its
+`geo` block says the same edges, so `gpio check spec` has nothing to warn about.
+
+When a table's `geo` block states `edges` and its GeoArrow type says
+something else, the `geo` block wins. Only a GeoParquet edge algorithm counts,
+so an `edges` value gpio does not know is read as no declaration at all.
+
 When a GeoParquet 2.0 input declares an ellipsoidal edges algorithm
 (`vincenty`, `karney`, `andoyer`, `thomas`) and the output is 1.x, the
 algorithm is mapped to `"spherical"` — the only non-planar value 1.x supports
 — with a warning. 2.0 outputs keep the algorithm verbatim.
+
+### Geodesic Bounding Boxes for GEOGRAPHY
+
+A 2.0 output whose column carries non-planar edges comes out as a native
+Parquet `GEOGRAPHY`, and its bounding boxes — each row group's geospatial
+statistics and the `geo` block's per-column `bbox` — are computed over the
+**geodesic edges**, not just the vertices. A long east–west great-circle edge
+at high latitude bulges poleward (`LINESTRING (-30 60, 30 60)` peaks near
+63.4°N, not 60°), so a vertex-only box would let a reader prune row groups
+that really match. gpio writes the bulged box instead:
+
+- `spherical` edges get the exact great-circle bound; the ellipsoidal
+  algorithms (`vincenty`, `thomas`, `andoyer`, `karney`) get the bound of the
+  geodesic on the column CRS's ellipsoid (WGS84 when it names none), from the
+  geodesic's own azimuths. Edges longer than 170° of arc on the ellipsoid,
+  and antipodal edges on the sphere, bound to the whole globe.
+- A polygon whose interior holds a pole reaches it. Without an `orientation`
+  in the `geo` block, a ring's interior is the smaller of the two regions it
+  bounds — the reading the GeoParquet spec says readers typically make; with
+  `orientation: "counterclockwise"` it is the left of the ring.
+- Geometry that crosses the antimeridian gets `xmin > xmax`, the wrap form
+  both Parquet's statistics and RFC 7946 §5.2 define.
+- A row group that cannot be bounded — unreadable WKB, or a NaN, infinite or
+  out-of-range coordinate — loses its box (and the file-level `bbox` goes
+  too), with a warning. A missing box is always legal; it only gives up
+  pruning.
+
+1.x outputs have no `GEOGRAPHY` type, but a `spherical` column's `geo` block
+`bbox` is the geodesic bound there too. A bbox covering column is per-row
+data and stays the vertex box of each row.
 
 ### Z and M Dimensions
 
@@ -564,6 +611,49 @@ still counts and warns about the invalid features it left untouched.
 Only invalid geometry is touched: valid geometry is byte-identical, NULL is
 preserved, and bounding boxes stay correct (`ST_MakeValid` never expands an
 envelope).
+
+#### Spherical (non-planar) edges are never planar-repaired
+
+Planar validity is the wrong test for a column that declares non-planar edges —
+`edges: spherical` (or an ellipsoidal algorithm such as `vincenty` or `karney`)
+in the input's `geo` metadata, a GeoArrow non-planar edge type, or a native
+Parquet `GEOGRAPHY` logical type (the normal shape of
+BigQuery GEOGRAPHY exports and S2-based pipelines). A pole-enclosing ring like
+`POLYGON ((0 80, 90 80, 180 80, -90 80, 0 80))` is valid on the sphere but
+collinear (zero area) on the plane, and `ST_MakeValid` would collapse it into
+line fragments.
+
+For such columns gpio **skips** the planar repair and its invalid count
+entirely and warns — even when repair is requested explicitly, because planar
+repair is actively destructive on spherical data. The geometry passes through
+unchanged. An `edges` value that is not a GeoParquet edge algorithm is not a
+declaration gpio can honor, so that column keeps the planar repair. Repair on
+the sphere (via the S2 `geography` extension) is a planned follow-up.
+
+=== "CLI"
+
+    <!-- doctest: skip="needs an input declaring spherical edges" -->
+    ```bash
+    # Input declares edges: spherical — geometry passes through unchanged
+    gpio convert geoparquet spherical.parquet output.parquet
+    # Skipping planar geometry repair for column 'geometry': it declares 'spherical' edges, ...
+    ```
+
+=== "Python"
+
+    ```python
+    import geoparquet_io as gpio
+    ```
+
+    <!-- doctest: skip="needs an input declaring spherical edges" -->
+    ```python
+    # Same skip through the Python API — the warning is logged, and the
+    # returned table's geo metadata keeps edges: spherical
+    gpio.convert("spherical.parquet").write("output.parquet")
+    ```
+
+    The geometry bytes pass through unchanged, and `Table.write` restates the
+    edges in the written file's metadata, as the CLI command above does.
 
 ### Curved Geometries
 

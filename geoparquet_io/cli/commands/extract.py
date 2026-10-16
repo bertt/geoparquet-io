@@ -872,8 +872,12 @@ def _deprecated_version_callback(ctx, param, value):
     "--axis-order",
     type=click.Choice(["auto", "xy", "latlon"]),
     default="auto",
-    help="Bbox axis order. 'auto' (default) detects from CRS format. "
-    "'xy' forces lon,lat order. 'latlon' forces lat,lon order.",
+    help="Order the server reads --bbox in. Pass --bbox as x,y (lon,lat). 'auto' "
+    "(default) picks the form every server reads alike, CRS84 for lon/lat and "
+    "lat,lon with the EPSG URN for other lat,lon CRSs. 'xy' always sends x,y "
+    "with the short EPSG:<code> label (CRS84 for lon/lat). 'latlon' also "
+    "sends a lon/lat bbox as lat,lon, for servers such as ArcGIS WFS that read "
+    "every EPSG:4326 bbox that way. Ignored on WFS 1.0.0, which reads x,y.",
 )
 @click.option(
     "--strict-crs",
@@ -883,7 +887,11 @@ def _deprecated_version_callback(ctx, param, value):
 )
 @click.option(
     "--bbox",
-    help="Bounding box: xmin,ymin,xmax,ymax in WGS84",
+    help="Bounding box: xmin,ymin,xmax,ymax, x,y, in the CRS gpio requests from the layer "
+    "(--output-crs when the layer offers it, else EPSG:4326 when offered, "
+    "else the layer's default CRS). It is not reprojected. When it looks like "
+    "lon/lat on a projected layer, or matches nothing, gpio prints the box "
+    "reprojected into the layer CRS as a hint",
 )
 @click.option(
     "--bbox-mode",

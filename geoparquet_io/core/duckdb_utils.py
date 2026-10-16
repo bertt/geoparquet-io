@@ -6,22 +6,27 @@ with appropriate extensions loaded for GeoParquet operations.
 """
 
 import datetime
+import functools
+import inspect
+import itertools
+import json
 import os
 import re
 import shutil
 import tempfile
 import threading
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from typing import Any, TypeVar
 
 import duckdb
 
 from geoparquet_io.core.exceptions import ExtensionUnavailableError, ValidationError
 from geoparquet_io.core.logging_config import debug, warn
 from geoparquet_io.core.parquet_schema import root_schema_columns
-from geoparquet_io.core.remote import needs_httpfs
+from geoparquet_io.core.remote import is_s3_url, needs_httpfs
 
 # Per-bucket cache for S3 buckets that require authentication
 # Buckets not in this set are accessed without credentials (works for public buckets)
@@ -48,6 +53,148 @@ def s3_config_scope(s3_config: dict):
         yield
     finally:
         _active_s3_config.reset(token)
+
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def uses_aws_profile(func: _F) -> _F:
+    """Run ``func`` with its ``profile`` argument as the ambient AWS profile.
+
+    The profile goes into :func:`s3_config_scope`, which DuckDB's
+    ``credential_chain`` secret and the obstore store read explicitly. Nothing is
+    written to ``os.environ``, so a call with ``profile="prod"`` cannot change
+    the credentials of a later call (#1055). A ``None`` profile leaves any outer
+    scope as it is, and so does a call with no S3 URL among its arguments: an
+    AWS profile means nothing to a local, https, gs or az path, and scoping it
+    there would only load the ``aws`` extension for nothing.
+
+    The profile counts as explicit, so it wins over env keys (see
+    :func:`_resolve_s3_settings`). The scope is a ContextVar, so a worker thread
+    started inside ``func`` does not see it. Copy the context
+    (``contextvars.copy_context().run``) if a worker opens an S3 connection.
+    """
+    signature = inspect.signature(func)
+    if "profile" not in signature.parameters:
+        raise TypeError(f"{func.__qualname__} has no 'profile' parameter")
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        arguments = signature.bind_partial(*args, **kwargs).arguments
+        profile = arguments.get("profile")
+        if not profile or not _any_s3_url(arguments.values()):
+            return func(*args, **kwargs)
+        with s3_config_scope({"profile": profile, "profile_from_env": False}):
+            return func(*args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]
+
+
+def _any_s3_url(values: Iterable[Any]) -> bool:
+    """Whether any value, or any item of a list/tuple value, is an S3 URL."""
+    for value in values:
+        items = value if isinstance(value, (list, tuple)) else (value,)
+        if any(is_s3_url(item) for item in items):
+            return True
+    return False
+
+
+# The providers a secret with a named PROFILE tries. duckdb-aws reads PROFILE
+# without CHAIN as "the config-file provider only" (aws_secret.cpp), which drops
+# SSO and credential_process profiles that the SDK default chain plus
+# AWS_PROFILE used to resolve. Naming them keeps those working. env is left out
+# on purpose: only an explicit profile (--aws-profile, profile=) gets here, and
+# the AWS CLI lets an explicit --profile win over env keys. An exported
+# AWS_PROFILE does not get here (see _resolve_s3_settings), so env keys still
+# beat it, as they do in the AWS SDK.
+#
+# Known limit: for an assume-role profile (role_arn plus source_profile),
+# duckdb-aws signs the STS AssumeRole call with the SDK default chain, not the
+# source_profile keys. No CHAIN value changes that today.
+_NAMED_PROFILE_CHAIN = "config;process;sso"
+
+
+def _resolve_s3_settings(
+    s3_endpoint: str | None, s3_region: str | None, s3_use_ssl: bool | None
+) -> dict:
+    """The S3 settings a connection gets: explicit kwargs over the ambient scope.
+
+    The one place they are resolved. Both the ``SET s3_*`` statements and the
+    ``credential_chain`` secret are built from this dict, so they cannot
+    disagree: DuckDB reads a secret's endpoint and region over ``SET``, so a
+    secret built from anything else silently wins.
+
+    ``profile`` is only an explicit one. A profile that is just the exported
+    ``AWS_PROFILE`` is left to the SDK default chain, which reads it itself
+    after env keys, so the secret keeps the AWS SDK order and main's behavior.
+    """
+    ambient = _active_s3_config.get() or {}
+    explicit_profile = None if ambient.get("profile_from_env") else ambient.get("profile")
+    return {
+        "profile": explicit_profile,
+        "endpoint": s3_endpoint if s3_endpoint is not None else ambient.get("s3_endpoint"),
+        "region": s3_region if s3_region is not None else ambient.get("s3_region"),
+        "use_ssl": s3_use_ssl if s3_use_ssl is not None else ambient.get("s3_use_ssl"),
+    }
+
+
+def _s3_secret_sql(settings: Mapping[str, Any]) -> str:
+    """The ``CREATE SECRET`` statement for the AWS credential chain.
+
+    ``settings`` is the dict from :func:`_resolve_s3_settings`. The secret
+    carries the same endpoint, URL style, SSL flag and region the ``SET``
+    statements apply, because a ``credential_chain`` secret otherwise defaults
+    its endpoint to ``s3.amazonaws.com`` and its region to the profile's, and
+    both beat ``SET``. A region left unset is still filled by DuckDB from
+    ``s3_region``, ``AWS_REGION`` or the profile, in that order.
+    """
+    params = ["TYPE s3", "PROVIDER credential_chain", "VALIDATION 'none'"]
+    profile = settings.get("profile")
+    if profile:
+        params.append(f"CHAIN '{_NAMED_PROFILE_CHAIN}'")
+        params.append(f"PROFILE '{_escape_sql_string(profile)}'")
+    endpoint = settings.get("endpoint")
+    if endpoint:
+        params.append(f"ENDPOINT '{_escape_sql_string(endpoint)}'")
+        params.append("URL_STYLE 'path'")
+        params.append(f"USE_SSL {'false' if settings.get('use_ssl') is False else 'true'}")
+    region = settings.get("region")
+    if region:
+        params.append(f"REGION '{_escape_sql_string(region)}'")
+    body = ",\n    ".join(params)
+    return f"CREATE OR REPLACE SECRET (\n    {body}\n);"
+
+
+def _create_s3_secret(con, settings: Mapping[str, Any], *, required: bool) -> None:
+    """Load ``aws`` and create the credential chain secret on ``con``.
+
+    ``required`` is the caller's ``use_s3_auth``: a private bucket read needs
+    the secret, so a missing ``aws`` extension is an error. A secret that only
+    an ambient profile asked for is best effort. The connection may never read
+    S3 at all (gs, az), and an offline machine must not fail on ``INSTALL aws``.
+    """
+    try:
+        _install_and_load_extension(con, "aws")
+    except Exception as e:
+        if required:
+            raise
+        debug(f"Skipping the AWS profile secret, the aws extension is unavailable: {e}")
+        return
+    con.execute(_s3_secret_sql(settings))
+
+
+def _apply_s3_settings(con, settings: Mapping[str, Any]) -> None:
+    """``SET`` the resolved endpoint and region for reads that use no secret."""
+    endpoint = settings.get("endpoint")
+    if endpoint:
+        con.execute(f"SET s3_endpoint='{_escape_sql_string(endpoint)}';")
+        con.execute("SET s3_url_style='path';")
+        ssl_value = "false" if settings.get("use_ssl") is False else "true"
+        con.execute(f"SET s3_use_ssl={ssl_value};")
+
+    region = settings.get("region")
+    if region:
+        con.execute(f"SET s3_region='{_escape_sql_string(region)}';")
 
 
 def get_active_s3_config() -> dict:
@@ -987,6 +1134,183 @@ def _apply_connection_limits(
         con.execute(f"SET threads = {cap}")
 
 
+_PROFILE_ENV_VAR = "GPIO_DUCKDB_PROFILE"
+
+# Values a user reaching for an on/off switch would type. GPIO_DUCKDB_PROFILE
+# names a directory, so one of these is only honoured when that directory
+# already exists; otherwise `=1` would quietly create a ./1/ directory.
+_PROFILE_FLAG_LIKE = frozenset({"1", "0", "true", "false", "yes", "no", "on", "off"})
+
+# Distinguishes connections opened within one process; itertools.count is
+# safe under threads.
+_profile_connection_ids = itertools.count(1)
+
+
+def _profile_file_prefix() -> str:
+    """A per-connection filename prefix that does not collide across processes.
+
+    Microsecond time plus PID plus a random token: the PID alone repeats
+    across containers (often PID 1), and second resolution repeats within a
+    run. The connection counter keeps the names in opening order.
+    """
+    stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    token = uuid.uuid4().hex[:6]
+    return f"gpio-profile-{stamp}-p{os.getpid()}-{token}-c{next(_profile_connection_ids)}"
+
+
+def _ensure_profile_directory(directory: str) -> OSError | None:
+    """Create *directory* if missing and probe that a file can be written.
+
+    Returns the ``OSError`` that made it unusable, or ``None`` when usable.
+    """
+    try:
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=directory, prefix=".gpio-profile-probe-"):
+            pass
+    except OSError as exc:
+        return exc
+    return None
+
+
+def _profile_directory() -> str | None:
+    """The usable ``GPIO_DUCKDB_PROFILE`` directory, or ``None`` (profiling off).
+
+    The path is resolved to an absolute path here, once, so a later
+    ``os.chdir`` cannot move it. An unusable path (or a flag-like value such
+    as ``1``/``true`` that is not an existing directory) warns and returns
+    ``None`` rather than raising: DuckDB fails *every* query on a connection
+    whose ``profiling_output`` cannot be written (an InternalException at fetch
+    time), so profiling must be refused up front — it may never break the
+    actual work.
+    """
+    raw = os.environ.get(_PROFILE_ENV_VAR, "").strip()
+    if not raw:
+        return None
+    if raw.lower() in _PROFILE_FLAG_LIKE and not os.path.isdir(raw):
+        warn(
+            f"GPIO_DUCKDB_PROFILE={raw!r} looks like an on/off flag, but it names the "
+            "directory to write DuckDB profiles into (e.g. GPIO_DUCKDB_PROFILE=profiles); "
+            "continuing without DuckDB profiling"
+        )
+        return None
+    directory = os.path.abspath(raw)
+    exc = _ensure_profile_directory(directory)
+    if exc is not None:
+        warn(
+            f"GPIO_DUCKDB_PROFILE={raw!r} is not a writable directory ({exc}); "
+            "continuing without DuckDB profiling"
+        )
+        return None
+    return directory
+
+
+class ProfiledConnection:
+    """A DuckDB connection whose queries each write their own JSON profile.
+
+    DuckDB's ``profiling_output`` setting names *one* file, and each profiled
+    statement overwrites it, so a fixed path would keep only the last query's
+    profile. This wrapper re-points ``profiling_output`` at a fresh file in
+    the ``GPIO_DUCKDB_PROFILE`` directory before every ``execute``,
+    ``executemany`` and ``sql`` call; a ``SET`` writes no profile itself, so
+    the rotation never clobbers anything, and a name already on disk is
+    skipped, so no existing file is overwritten by a rotation.
+
+    What gets captured is decided by DuckDB, not by this wrapper: DuckDB
+    writes a statement's profile only when its result is *fully consumed*
+    (``fetchall()``, ``.arrow().read_all()``, a ``COPY``, a ``fetchone()``
+    read until it returns ``None``). A result read with a single
+    ``fetchone()``, or abandoned when the next statement runs, writes no
+    profile. DDL and ``SET`` write none either. So a command's profile
+    directory holds its result-draining queries — usually the heavy ones —
+    not every statement it ran.
+
+    A lazy relation from ``sql()`` executes when it is fetched, and DuckDB
+    writes its profile to whichever file is current *then*: fetched straight
+    away it gets its own file, but fetched after another statement it
+    replaces that statement's profile (DuckDB overwrites its output file, and
+    no hook runs before a relation executes).
+
+    Before each rotation the directory is re-checked (and re-created if it
+    was deleted). If it can no longer be written, profiling is switched off
+    on this connection with a single warning, so profiling never breaks the
+    work. A directory removed, or a disk filled, *during* a statement still
+    fails that statement at fetch time; it is not retried, because the
+    statement's side effects (a ``COPY`` file, say) have already happened.
+
+    ``cursor()`` returns a profiled cursor (a cursor is a new DuckDB session
+    and would not inherit the setting). Everything else delegates to the
+    wrapped connection. It is a proxy, not a ``DuckDBPyConnection`` subclass:
+    ``isinstance(con, duckdb.DuckDBPyConnection)`` is False for it, and it
+    cannot be handed to a DuckDB API that takes ``connection=``. gpio does
+    neither, which is why returning it from :func:`get_duckdb_connection` is
+    safe.
+    """
+
+    def __init__(self, con: "duckdb.DuckDBPyConnection", directory: str):
+        self._con = con
+        self._directory = directory
+        self._prefix = _profile_file_prefix()
+        self._statement_ids = itertools.count(1)
+        self._enabled = True
+        # Order matters: DuckDB rejects a .json profiling_output until
+        # enable_profiling is 'json'. The window between the two SETs is safe
+        # because SET statements are themselves never profiled.
+        con.execute("SET enable_profiling = 'json';")
+        self._rotate_profile_output()
+
+    def _directory_usable(self) -> bool:
+        if os.path.isdir(self._directory) and os.access(self._directory, os.W_OK):
+            return True
+        exc = _ensure_profile_directory(self._directory)
+        if exc is None:
+            return True
+        self._enabled = False
+        self._con.execute("PRAGMA disable_profiling;")
+        warn(
+            f"GPIO_DUCKDB_PROFILE directory {self._directory!r} is no longer writable "
+            f"({exc}); DuckDB profiling is off for the rest of this connection"
+        )
+        return False
+
+    def _rotate_profile_output(self) -> None:
+        if not self._enabled or not self._directory_usable():
+            return
+        while True:
+            name = f"{self._prefix}-q{next(self._statement_ids):04d}.json"
+            target = os.path.join(self._directory, name)
+            if not os.path.exists(target):
+                break
+        self._con.execute(f"SET profiling_output = '{_escape_sql_string(target)}';")
+
+    def execute(self, *args, **kwargs):
+        self._rotate_profile_output()
+        return self._con.execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        self._rotate_profile_output()
+        return self._con.executemany(*args, **kwargs)
+
+    def sql(self, *args, **kwargs):
+        self._rotate_profile_output()
+        return self._con.sql(*args, **kwargs)
+
+    def cursor(self):
+        cur = self._con.cursor()
+        if not self._enabled:
+            return cur
+        return ProfiledConnection(cur, self._directory)
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
+    def __enter__(self):
+        self._con.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._con.__exit__(*exc_info)
+
+
 def get_duckdb_connection(
     load_spatial=True,
     load_httpfs=None,
@@ -1037,8 +1361,24 @@ def get_duckdb_connection(
                     ``threads`` to what it affords (``_apply_connection_limits``);
                     a value given here is used as given.
 
+    Environment:
+        GPIO_DUCKDB_PROFILE: a directory path (resolved to an absolute path
+            when the connection opens). When set, the connection runs with
+            ``enable_profiling = 'json'`` and writes one profile file per
+            fully consumed query into that directory (created if missing),
+            named ``gpio-profile-<time>-p<pid>-<token>-c<n>-q<n>.json``; see
+            :class:`ProfiledConnection` for which statements DuckDB profiles.
+            An unusable path, or a flag-like value such as ``1``/``true`` that
+            is not an existing directory, warns and profiling is skipped; the
+            work itself is not failed by profiling.
+
     Returns:
-        duckdb.DuckDBPyConnection: Configured connection with extensions loaded
+        duckdb.DuckDBPyConnection | ProfiledConnection: Configured connection
+        with extensions loaded. When GPIO_DUCKDB_PROFILE names a usable
+        directory it is a :class:`ProfiledConnection`, a proxy that delegates
+        to the DuckDB connection (it is not a subclass). The return is left
+        unannotated because the many helpers typed ``duckdb.DuckDBPyConnection``
+        that receive it use only the methods the proxy forwards.
     """
     config = {}
     if threads is not None:
@@ -1072,38 +1412,28 @@ def get_duckdb_connection(
         # Replaces per-call always_xy := true in ST_Transform.
         con.execute("SET geometry_always_xy = true;")
 
+    # S3 config, resolved once (explicit kwargs over the ambient scope). The
+    # SET statements and the secret below are both built from it.
+    s3_settings = _resolve_s3_settings(s3_endpoint, s3_region, s3_use_ssl)
+
     # Load httpfs for cloud storage support
     if load_httpfs:
         _install_and_load_extension(con, "httpfs")
 
-        # Only configure AWS credentials if explicitly requested (for private buckets)
-        # Public buckets work without any secret - DuckDB handles them automatically
-        if use_s3_auth:
-            _install_and_load_extension(con, "aws")
-            con.execute("""
-                CREATE OR REPLACE SECRET (
-                    TYPE s3,
-                    PROVIDER credential_chain,
-                    VALIDATION 'none'
-                );
-            """)
+        # Only configure AWS credentials when asked for: use_s3_auth (private
+        # buckets) or a scoped AWS profile, which only the credential chain can
+        # honor. Public buckets work without any secret.
+        if use_s3_auth or s3_settings["profile"]:
+            _create_s3_secret(con, s3_settings, required=use_s3_auth)
 
-    # Apply S3 config: explicit kwargs override ambient config
-    ambient = _active_s3_config.get() or {}
-    eff_endpoint = s3_endpoint if s3_endpoint is not None else ambient.get("s3_endpoint")
-    eff_region = s3_region if s3_region is not None else ambient.get("s3_region")
-    eff_use_ssl = s3_use_ssl if s3_use_ssl is not None else ambient.get("s3_use_ssl")
+    _apply_s3_settings(con, s3_settings)
 
-    if eff_endpoint:
-        safe_endpoint = _escape_sql_string(eff_endpoint)
-        con.execute(f"SET s3_endpoint='{safe_endpoint}';")
-        con.execute("SET s3_url_style='path';")
-        ssl_value = "true" if eff_use_ssl is not False else "false"
-        con.execute(f"SET s3_use_ssl={ssl_value};")
-
-    if eff_region:
-        safe_region = _escape_sql_string(eff_region)
-        con.execute(f"SET s3_region='{safe_region}';")
+    # GPIO_DUCKDB_PROFILE=<dir>: wrap the connection (after all setup, so the
+    # setup statements above are not profiled) to write one JSON profile per
+    # query into <dir>. An unusable directory warned and returned None.
+    profile_dir = _profile_directory()
+    if profile_dir is not None:
+        return ProfiledConnection(con, profile_dir)
 
     return con
 
@@ -1192,7 +1522,7 @@ def get_duckdb_connection_for_s3(
     s3_endpoint: str | None = None,
     s3_region: str | None = None,
     s3_use_ssl: bool | None = None,
-) -> "duckdb.DuckDBPyConnection":
+) -> "duckdb.DuckDBPyConnection | ProfiledConnection":
     """
     Get DuckDB connection configured for S3 access.
 
@@ -1208,7 +1538,9 @@ def get_duckdb_connection_for_s3(
         s3_use_ssl: Whether to use SSL for the S3 endpoint
 
     Returns:
-        duckdb.DuckDBPyConnection: Configured connection with appropriate S3 access
+        duckdb.DuckDBPyConnection | ProfiledConnection: Configured connection
+        with appropriate S3 access (a ProfiledConnection proxy when
+        GPIO_DUCKDB_PROFILE is set; see :func:`get_duckdb_connection`)
     """
 
     s3_kwargs = {"s3_endpoint": s3_endpoint, "s3_region": s3_region, "s3_use_ssl": s3_use_ssl}
@@ -1546,12 +1878,15 @@ def _wrap_query_with_wkb_conversion(query: str, geometry_column: str, con=None) 
     if con:
         try:
             columns = _get_query_columns(con, query)
-            other_cols = [
-                quote_identifier(c) for c in columns if c.lower() != geometry_column.lower()
+            # In the query's own order: appending the geometry moved a column
+            # after it (a bbox) ahead of it in the written file.
+            is_geom = [c.lower() == geometry_column.lower() for c in columns]
+            select = [
+                f"ST_AsWKB({quoted_geom}) AS {quoted_geom}" if geom else quote_identifier(c)
+                for c, geom in zip(columns, is_geom, strict=True)
             ]
-            if other_cols:
-                cols_str = ", ".join(other_cols)
-                return f"SELECT {cols_str}, ST_AsWKB({quoted_geom}) AS {quoted_geom} FROM ({query})"
+            if any(is_geom) and not all(is_geom):
+                return f"SELECT {', '.join(select)} FROM ({query})"
         except Exception:
             pass
 
@@ -1639,3 +1974,198 @@ def _wrap_query_with_blob_conversion(
         SELECT * REPLACE ({replacements})
         FROM __arrow_source
     """
+
+
+# ---------------------------------------------------------------------------
+# Registering an Arrow table: the one step that hands DuckDB in-memory geometry
+# ---------------------------------------------------------------------------
+
+_EXT_NAME = b"ARROW:extension:name"
+_EXT_META = b"ARROW:extension:metadata"
+
+
+def _geoarrow_extension(field) -> tuple[str | None, dict]:
+    """A field's GeoArrow extension name and parsed metadata, in either carrier.
+
+    pyarrow resolves the type when ``geoarrow.pyarrow`` is imported and leaves
+    it as storage plus field metadata when it is not; DuckDB reads both.
+    """
+    ext_type = field.type
+    name = getattr(ext_type, "extension_name", None)
+    if name is not None:
+        raw = ext_type.__arrow_ext_serialize__()
+    else:
+        metadata = field.metadata or {}
+        name = metadata.get(_EXT_NAME, b"").decode("utf-8") or None
+        raw = metadata.get(_EXT_META)
+    if not name or not name.startswith("geoarrow."):
+        return None, {}
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except ValueError:
+        parsed = {}
+    return name, parsed if isinstance(parsed, dict) else {}
+
+
+def geoarrow_field_edges(field) -> str | None:
+    """The edges a GeoArrow field declares, lower-case, in either carrier.
+
+    ``None`` when the field is not GeoArrow or declares no edges (planar is
+    the GeoArrow default, so a planar type serializes without the key). The
+    one reader of a field's edges: ``arrow_geo_metadata`` re-exports it.
+
+    The type only, by design. DuckDB never reads a ``geo`` block, so which
+    columns it refuses is a type question, and the register path relabels on
+    this answer even when a block says planar or the value is a typo. What a
+    table declares once its block is weighed is
+    ``write_funnels.table_nonplanar_edges``.
+    """
+    edges = _geoarrow_extension(field)[1].get("edges")
+    return edges.lower() if isinstance(edges, str) else None
+
+
+def _storage(column):
+    """A column's storage chunks, whether or not its extension type is resolved."""
+    import pyarrow as pa
+
+    if isinstance(column.type, pa.ExtensionType):
+        return pa.chunked_array(
+            [chunk.storage for chunk in column.chunks], column.type.storage_type
+        )
+    return column
+
+
+def _planar_column(field, column, name: str, parsed: dict) -> tuple:
+    """``(field, column)`` relabelled planar, over the same buffers and CRS.
+
+    A resolved GeoArrow type stays resolved (its ``with_edge_type``); one that
+    pyarrow left as storage plus field metadata loses the ``edges`` key there.
+    """
+    import pyarrow as pa
+
+    if hasattr(field.type, "with_edge_type"):
+        import geoarrow.pyarrow as ga
+
+        target = field.type.with_edge_type(ga.EdgeType.PLANAR)
+        chunks = [pa.ExtensionArray.from_storage(target, c.storage) for c in column.chunks]
+        return field.with_type(target), pa.chunked_array(chunks, target)
+    storage = _storage(column)
+    metadata = dict(field.metadata or {})
+    metadata[_EXT_NAME] = name.encode("utf-8")
+    metadata[_EXT_META] = json.dumps({k: v for k, v in parsed.items() if k != "edges"}).encode(
+        "utf-8"
+    )
+    return pa.field(field.name, storage.type, field.nullable, metadata), storage
+
+
+def _planar_view(table, columns: Iterable[str] | None = None) -> tuple:
+    """``table`` with each non-planar GeoArrow column relabelled planar.
+
+    Zero-copy: only the ``edges`` value changes. ``columns`` limits it to
+    those names. Returns the view and the input fields it relabelled, keyed
+    by name. A field whose metadata does not parse is left as it is.
+    """
+    wanted = None if columns is None else set(columns)
+    originals: dict = {}
+    for index, field in enumerate(table.schema):
+        if wanted is not None and field.name not in wanted:
+            continue
+        if geoarrow_field_edges(field) in (None, "planar"):
+            continue
+        name, parsed = _geoarrow_extension(field)
+        originals[field.name] = field
+        planar_field, column = _planar_column(field, table.column(index), name, parsed)
+        table = table.set_column(index, planar_field, column)
+    return table, originals
+
+
+class RegisteredArrow:
+    """What :func:`register_arrow` registered, and how to give the edges back.
+
+    DuckDB has no GEOGRAPHY type: a registered column is a planar GEOMETRY
+    there. An operation that passes a geometry column through unchanged calls
+    :meth:`restore_edges` on its result. One that computes new geometry in
+    planar math (an aggregation's cells, a reprojection, a planar repair or
+    simplification) must not: the edges would then describe shapes that were
+    never built on the sphere.
+    """
+
+    def __init__(self, name: str, fields: dict) -> None:
+        self.name = name
+        self.fields = fields
+
+    @property
+    def edges(self) -> dict[str, str]:
+        """``{column: edges}`` for every column that was registered as planar."""
+        return {col: geoarrow_field_edges(field) or "planar" for col, field in self.fields.items()}
+
+    def restore_edges(self, result, columns: Iterable[str] | None = None):
+        """``result`` with each pass-through geometry column given its input field back.
+
+        Restores the input's exact field (type, CRS, edges, field metadata) on
+        every registered non-planar column that ``result`` still holds as WKB
+        bytes; ``columns`` limits it to those names. A column that came back as
+        anything but binary (text, a struct) is left alone.
+
+        It matches by name only. The caller must know that each restored name
+        still holds the input column's geometry. A query that puts other data
+        under a registered name (``SELECT pt AS geometry``) would get the input
+        field, edges and all. Nothing in the result tells the two apart (same
+        storage, often the same CRS), so pass ``columns`` or skip the restore.
+        """
+        import pyarrow as pa
+
+        names = self.fields if columns is None else [c for c in columns if c in self.fields]
+        for col in names:
+            if col not in result.column_names:
+                continue
+            original = self.fields[col]
+            index = result.schema.get_field_index(col)
+            storage = _storage(result.column(index))
+            if not (pa.types.is_binary(storage.type) or pa.types.is_large_binary(storage.type)):
+                continue
+            target = original.type
+            is_ext = isinstance(target, pa.ExtensionType)
+            storage = storage.cast(target.storage_type if is_ext else target)
+            if is_ext:
+                storage = pa.chunked_array(
+                    [pa.ExtensionArray.from_storage(target, c) for c in storage.chunks], target
+                )
+            result = result.set_column(index, original, storage)
+        return result
+
+
+def register_arrow(con, name: str, table) -> RegisteredArrow:
+    """Register the Arrow ``table`` on ``con`` as ``name``, non-planar edges and all.
+
+    The one way gpio hands an in-memory table to DuckDB (#1253). DuckDB 1.5
+    refuses a ``geoarrow.wkb`` column whose ``edges`` is anything but
+    ``"planar"`` ("Can't import non-planar edges") and has no setting to accept
+    one. So each such column is registered as a planar view of the same
+    buffers, and the returned :class:`RegisteredArrow` keeps the input fields
+    for :meth:`RegisteredArrow.restore_edges`. The caller's table is unchanged.
+
+    Every non-planar string is relabelled, not only a GeoParquet edge
+    algorithm, because DuckDB rejects them all. Which values gpio honours is
+    the restore side's question (``geo_metadata.GEOGRAPHY_EDGE_ALGORITHMS``).
+    """
+    view, registered = planar_view(table, name)
+    if registered.fields:
+        debug(
+            f"Registering {', '.join(sorted(registered.fields))} on DuckDB as planar "
+            "GEOMETRY: DuckDB cannot import non-planar edges (#1253)"
+        )
+    con.register(name, view)
+    return registered
+
+
+def planar_view(table, name: str = "table", columns: Iterable[str] | None = None) -> tuple:
+    """``(view, RegisteredArrow)``: the planar view DuckDB can read, and the way back.
+
+    For the paths that hand DuckDB a table some other way than ``register``
+    (a temp Parquet file read back with ``read_parquet``, a write strategy):
+    DuckDB reads a GEOGRAPHY column as planar GEOMETRY, so the result needs
+    the same restore. ``columns`` limits the relabel to those names.
+    """
+    view, fields = _planar_view(table, columns)
+    return view, RegisteredArrow(name, fields)

@@ -11,12 +11,14 @@ import pyarrow.parquet as pq
 from geoparquet_io.core.common import get_parquet_metadata
 from geoparquet_io.core.duckdb_utils import (
     get_duckdb_connection,
+    planar_view,
     quote_identifier,
     sql_path,
 )
 from geoparquet_io.core.exceptions import InvalidParameterError
 from geoparquet_io.core.file_utils import handle_output_overwrite, resolve_file_url
 from geoparquet_io.core.geometry_detection import find_primary_geometry_column
+from geoparquet_io.core.geometry_repair import warn_planar_math, warn_planar_math_for_file
 from geoparquet_io.core.logging_config import (
     configure_verbose,
     debug,
@@ -400,7 +402,11 @@ def add_kdtree_table(
     os.close(temp_fd)
 
     try:
-        pq.write_table(table, temp_path)
+        # DuckDB reads a GEOGRAPHY column back as planar GEOMETRY, so the temp
+        # copy is the planar view and the result gets the input's edges back (#1253).
+        warn_planar_math("add_kdtree", table, geom_col)
+        view, registered = planar_view(table, "kdtree_input")
+        pq.write_table(view, temp_path)
 
         if iterations is None:
             # The temp copy's size stands in for the input's: an in-memory table
@@ -426,7 +432,7 @@ def add_kdtree_table(
             if table.schema.metadata:
                 result = result.replace_schema_metadata(table.schema.metadata)
 
-            return result
+            return registered.restore_edges(result)
         finally:
             con.close()
     finally:
@@ -491,6 +497,8 @@ def add_kdtree_column(
     configure_verbose(verbose)
 
     require_iterations_or_auto(iterations, auto_target_rows)
+
+    warn_planar_math_for_file("add_kdtree", input_parquet)
 
     # Check for streaming mode (stdin input or stdout output)
     is_streaming = is_stdin(input_parquet) or should_stream_output(output_parquet)

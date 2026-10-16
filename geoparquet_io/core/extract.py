@@ -35,6 +35,7 @@ from geoparquet_io.core.duckdb_utils import (
     get_duckdb_connection,
     get_duckdb_connection_for_s3,
     quote_identifier,
+    register_arrow,
     sql_path,
     validate_where_clause,
 )
@@ -60,7 +61,10 @@ from geoparquet_io.core.geometry_detection import (
     STANDARD_GEOMETRY_NAMES,
     find_primary_geometry_column,
 )
-from geoparquet_io.core.geometry_repair import repair_query_geometry
+from geoparquet_io.core.geometry_repair import (
+    nonplanar_edges_of_arrow_table,
+    repair_query_geometry,
+)
 from geoparquet_io.core.logging_config import debug, info, progress, success, warn
 from geoparquet_io.core.parquet_writer import resolve_output_geoparquet_version
 from geoparquet_io.core.partition.reader import build_read_parquet_expr, require_parquet_files
@@ -76,7 +80,10 @@ from geoparquet_io.core.streaming import (
     is_stdin,
     should_stream_output,
 )
-from geoparquet_io.core.write_funnels import write_parquet_with_metadata
+from geoparquet_io.core.write_funnels import (
+    declared_nonplanar_edges,
+    write_parquet_with_metadata,
+)
 
 
 def get_parquet_row_count(parquet_file: str) -> int:
@@ -808,7 +815,7 @@ def extract_table(
 
     con = get_duckdb_connection(load_spatial=True, load_httpfs=False)
     try:
-        con.register("__input_table", table)
+        registered = register_arrow(con, "__input_table", table)
         source_ref, needs_wkb = (
             _setup_geometry_view(con, table, geom_col) if geom_col else ("__input_table", False)
         )
@@ -826,7 +833,11 @@ def extract_table(
         geometry_repaired = False
         if keeps_geometry:
             query, geometry_repaired = _repair_geometry_in_query(
-                con, query, geom_col, repair_geometry
+                con,
+                query,
+                geom_col,
+                repair_geometry,
+                nonplanar_edges=nonplanar_edges_of_arrow_table(table, geom_col),
             )
 
         result = con.execute(query).arrow().read_all()
@@ -841,24 +852,31 @@ def extract_table(
                 metadata = backfill_derived_stats(strip_derived_stats(metadata), result)
                 metadata = strip_orientation(metadata, geom_col)
             result = result.replace_schema_metadata(metadata)
-        return result
+        # The geometry passes through unless the planar repair rewrote it; a
+        # repaired column is planar GEOMETRY now and must not be relabelled (#1253).
+        passed_through = [c for c in registered.fields if not (geometry_repaired and c == geom_col)]
+        return registered.restore_edges(result, passed_through)
     finally:
         con.close()
 
 
 def _repair_geometry_in_query(
-    con, query: str, geometry_column: str, repair: bool
+    con, query: str, geometry_column: str, repair: bool, nonplanar_edges: str | None = None
 ) -> tuple[str, bool]:
     """Run the geometry repair pass, reporting whether it rewrote the query.
 
     :func:`repair_query_geometry` returns ``query`` unchanged when repair is off,
-    when the column is not repairable in place, and when it counted zero invalid
-    rows; it returns a rewritten query only when at least one row will actually
-    be repaired. That distinction is what decides whether the input's derived
-    stats survive into the output: a pass that changed nothing keeps them, so a
-    file with no invalid geometry is never rescanned for nothing.
+    when the column is not repairable in place, when the column declares
+    non-planar edges (planar validity is the wrong test there — #1287), and when
+    it counted zero invalid rows; it returns a rewritten query only when at
+    least one row will actually be repaired. That distinction is what decides
+    whether the input's derived stats and orientation survive into the output: a
+    pass that changed nothing keeps them, so a file with no invalid geometry is
+    never rescanned for nothing.
     """
-    repaired_query = repair_query_geometry(con, query, geometry_column, repair=repair)
+    repaired_query = repair_query_geometry(
+        con, query, geometry_column, repair=repair, nonplanar_edges=nonplanar_edges
+    )
     return repaired_query, repaired_query != query
 
 
@@ -952,7 +970,9 @@ def _extract_streaming(
     if should_stream_output(output_path):
         verbose = False
 
-    with open_input(input_path, verbose=verbose) as (source, metadata, is_stream, con):
+    with open_input(
+        input_path, verbose=verbose, stream_output=should_stream_output(output_path)
+    ) as (source, metadata, is_stream, con):
         # Get column names from query result (works with both table names and read_parquet)
         sample = con.execute(f"SELECT * FROM {source} LIMIT 0").description
         all_columns = [col[0] for col in sample]
@@ -988,7 +1008,15 @@ def _extract_streaming(
         query = _build_query_for_source(source, selected_columns, spatial_filter, where, limit)
 
         # Repair invalid geometry (issue #506) before streaming the write.
-        query, geometry_repaired = _repair_geometry_in_query(con, query, geom_col, repair_geometry)
+        query, geometry_repaired = _repair_geometry_in_query(
+            con,
+            query,
+            geom_col,
+            repair_geometry,
+            # open_input carries the resolved field model in metadata before
+            # DuckDB registration. It is also the only witness on later hops.
+            nonplanar_edges=declared_nonplanar_edges(None, metadata).get(geom_col),
+        )
 
         if verbose:
             debug(f"Streaming extraction query: {query}")
@@ -1221,7 +1249,11 @@ def _execute_extraction(
         geometry_repaired = False
         if geometry_col:
             query, geometry_repaired = _repair_geometry_in_query(
-                con, query, geometry_col, repair_geometry
+                con,
+                query,
+                geometry_col,
+                repair_geometry,
+                nonplanar_edges=declared_nonplanar_edges(input_parquet, metadata).get(geometry_col),
             )
 
         stale_columns = _stale_stat_columns(

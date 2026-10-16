@@ -31,6 +31,7 @@ from geoparquet_io.core.file_utils import (
     is_partition_path,
     resolve_file_url,
 )
+from geoparquet_io.core.geoarrow_compat import srid_crs_as_text
 from geoparquet_io.core.parquet_schema import root_schema_columns
 from geoparquet_io.core.remote import is_remote_url, is_s3_url, needs_httpfs
 
@@ -285,7 +286,7 @@ def _get_pyarrow_logical_type(field) -> str | None:
             if hasattr(field.type, "extension_metadata") and field.type.extension_metadata:
                 try:
                     ext_meta = json.loads(field.type.extension_metadata)
-                    crs = ext_meta.get("crs")
+                    crs = srid_crs_as_text(ext_meta).get("crs")
                     if crs:
                         return _format_geometry_type_crs(crs)
                 except (json.JSONDecodeError, TypeError):
@@ -857,8 +858,10 @@ def parse_geometry_logical_type(logical_type: str) -> dict | None:
     if crs is not None:
         result["crs"] = crs
 
-    # Parse algorithm for Geography
-    algo_match = re.search(r"algorithm=(planar|spherical)", params)
+    # Parse algorithm for Geography: the full parquet.thrift vocabulary, not
+    # just the 1.x pair -- an ellipsoidal algorithm read as "no algorithm"
+    # degraded to spherical in every caller's fallback (#1272).
+    algo_match = re.search(r"algorithm=(planar|spherical|vincenty|thomas|andoyer|karney)", params)
     if algo_match:
         result["algorithm"] = algo_match.group(1)
 
@@ -972,6 +975,9 @@ def resolve_crs_reference(parquet_file: str, crs_value: Any) -> Any:
     # Handle srid:XXXX format - convert to PROJJSON using pyproj
     if isinstance(crs_value, str) and crs_value.lower().startswith("srid:"):
         srid = crs_value[5:]  # Skip "srid:"
+        if srid.strip() == "0":
+            # `srid:0` is the type's spelling of an unknown CRS, not EPSG:0.
+            return None
         try:
             from pyproj import CRS
 

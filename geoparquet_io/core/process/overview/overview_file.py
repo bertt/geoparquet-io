@@ -54,6 +54,7 @@ from geoparquet_io.core.parquet_writer import (
     apply_output_kv_metadata,
     resolve_output_geoparquet_version,
     resolve_row_group_rows,
+    without_geometry_dictionary,
 )
 from geoparquet_io.core.write_funnels import extract_preserved_kv_metadata
 
@@ -373,14 +374,13 @@ def write_overview_file(
             geometry_column = carried_geometry_column(
                 sanitized_carried_geo(schema.metadata), schema.names
             )
-            with pq.ParquetWriter(
-                tmp_path,
+            # OVERVIEWS_SPEC 4.5: no dictionary encoding on the geometry.
+            writer_kwargs = without_geometry_dictionary(
+                {"compression": compression, "compression_level": compression_level},
                 schema,
-                compression=compression,
-                compression_level=compression_level,
-                # OVERVIEWS_SPEC 4.5: no dictionary encoding on the geometry.
-                use_dictionary=[n for n in schema.names if n != geometry_column],
-            ) as writer:
+                [geometry_column] if geometry_column else (),
+            )
+            with pq.ParquetWriter(tmp_path, schema, **writer_kwargs) as writer:
                 _write_levels(writer, files, data_schema, schema, rows_per_group)
             written = pq.read_metadata(tmp_path).num_row_groups
             if written != ends[-1] + 1:

@@ -29,13 +29,22 @@ import duckdb
 import pyarrow.parquet as pq
 
 from geoparquet_io.core.arrow_geo_metadata import (
-    _CARRIED_SCHEMA_METADATA_KEYS,
     _apply_geoparquet_metadata,
     _normalize_arrow_large_types,
     _write_table_with_settings,
+    nonplanar_edges_from_schema,
+    with_planar_edge_types,
 )
 from geoparquet_io.core.compression import validate_compression_settings
-from geoparquet_io.core.crs_utils import _wrap_query_with_crs, apply_output_crs
+from geoparquet_io.core.crs_utils import (
+    _wrap_query_with_crs,
+    apply_output_crs,
+    extract_crs_from_parquet,
+    get_crs_display_name,
+    is_geographic_crs,
+    is_unknown_type_crs,
+    parse_crs_string_to_projjson,
+)
 from geoparquet_io.core.derive_geo_from_file import (
     _rewrite_file_with_geo_metadata,
     derive_secondary_geometry_info,
@@ -56,6 +65,7 @@ from geoparquet_io.core.duckdb_utils import (
 from geoparquet_io.core.exceptions import InvalidParameterError
 from geoparquet_io.core.file_utils import is_partition_path
 from geoparquet_io.core.geo_metadata import (
+    GEOGRAPHY_EDGE_ALGORITHMS,
     GEOPARQUET_VERSIONS,
     SELF_EVIDENT_BBOX_COLUMN,
     carried_geometry_column,
@@ -66,6 +76,12 @@ from geoparquet_io.core.geo_metadata import (
     strip_bboxless_covering,
     strip_derived_stats,
     strip_nonplanar_edges,
+)
+from geoparquet_io.core.geodesic_bbox import (
+    ELLIPSOIDAL_ALGORITHMS,
+    ColumnBounds,
+    ellipsoid_for_crs,
+    geography_statistics,
 )
 from geoparquet_io.core.geometry_detection import (
     _detect_geometry_from_query,
@@ -81,11 +97,15 @@ from geoparquet_io.core.logging_config import (
 )
 from geoparquet_io.core.memory_limits import scoped_write_memory_limit
 from geoparquet_io.core.parquet_footer import (
+    EDGE_ALGORITHMS,
     FooterPatchRaced,
     FooterPatchUnsupported,
+    patch_footer,
     patch_footer_kv,
 )
+from geoparquet_io.core.parquet_schema import root_schema_columns
 from geoparquet_io.core.parquet_writer import (
+    _CARRIED_SCHEMA_METADATA_KEYS,
     geoparquet_copy_options,
     note_duckdb_copy_rounding,
     resolve_input_crs,
@@ -98,7 +118,11 @@ from geoparquet_io.core.write_strategies import (
     WriteStrategyFactory,
     needs_metadata_rewrite,
 )
-from geoparquet_io.core.write_strategies.base import merge_secondary_geometry_metadata
+from geoparquet_io.core.write_strategies.base import (
+    has_unknown_secondary,
+    merge_secondary_geometry_metadata,
+    wrap_query_with_secondary_crs,
+)
 
 
 def collect_nonplanar_edges(input_file: str) -> dict[str, str]:
@@ -120,7 +144,12 @@ def collect_nonplanar_edges(input_file: str) -> dict[str, str]:
             if edges and edges != "planar":
                 edges_by_col.setdefault(name, edges)
     except Exception as e:
-        debug(f"Could not collect edges metadata from {input_file}: {e}")
+        # Fail loudly: an empty answer reads as "planar", which re-enables the
+        # planar geometry repair and drops the edges from the output (#1287).
+        warn(
+            f"Could not read the edges metadata of {input_file}; treating its geometry "
+            f"as planar: {e}"
+        )
         return {}
     return edges_by_col
 
@@ -140,11 +169,11 @@ def _edges_for_output_version(edges: str, geo_version: str) -> str:
     return "spherical"
 
 
-def _collect_nonplanar_edges_from_metadata(original_metadata: dict | None) -> dict[str, str]:
-    """Map geometry column -> non-planar edges declared in an input KV metadata dict.
+def _block_edges(original_metadata: dict | None) -> dict[str, object]:
+    """Map geometry column -> the ``edges`` value its ``geo`` block states, as written.
 
-    Fallback for write paths that carry the input's KV metadata but not its
-    path (the native GEOGRAPHY logical-type half needs the file itself).
+    A column whose block has no ``edges`` key is left out: it says nothing.
+    An unreadable block reads as empty.
     """
     if not original_metadata:
         return {}
@@ -155,72 +184,304 @@ def _collect_nonplanar_edges_from_metadata(original_metadata: dict | None) -> di
         if isinstance(geo_data, bytes):
             geo_data = geo_data.decode("utf-8")
         geo_meta = json.loads(geo_data) if isinstance(geo_data, str) else geo_data
-        edges_by_col: dict[str, str] = {}
-        for name, col_meta in (geo_meta.get("columns") or {}).items():
-            edges = col_meta.get("edges") if isinstance(col_meta, dict) else None
-            if edges and edges != "planar":
-                edges_by_col[name] = edges
-        return edges_by_col
+        return {
+            name: col_meta["edges"]
+            for name, col_meta in (geo_meta.get("columns") or {}).items()
+            if isinstance(col_meta, dict) and "edges" in col_meta
+        }
     except Exception:
         return {}
 
 
-def _apply_nonplanar_edges(
+def _collect_nonplanar_edges_from_metadata(original_metadata: dict | None) -> dict[str, str]:
+    """Map geometry column -> non-planar edges declared in an input KV metadata dict.
+
+    Fallback for write paths that carry the input's KV metadata but not its
+    path (the native GEOGRAPHY logical-type half needs the file itself).
+    """
+    return {
+        name: edges
+        for name, edges in _block_edges(original_metadata).items()
+        if edges and edges != "planar"
+    }
+
+
+def apply_nonplanar_edges(
     edges_by_col: dict[str, str],
     output_file: str,
     compression: str = "ZSTD",
     compression_level: int | None = None,
     row_group_rows: int | None = None,
     verbose: bool = False,
+    pending_geo: dict | None = None,
 ) -> None:
-    """Re-attach non-planar edges declarations to an output's geo metadata (#588).
+    """Restate non-planar edges in an output's geo block *and* its logical types.
 
-    DuckDB has no GEOGRAPHY type, so rewrites demote native GEOGRAPHY columns
-    to GEOMETRY and drop ``edges`` from regenerated metadata. Losing the edge
-    interpretation silently corrupts semantics (great-circle edges read as
-    planar), so re-attach it to the output's geo metadata.
+    DuckDB reads a Parquet GEOGRAPHY column as a planar GEOMETRY and has no
+    geography type to write back, so every rewrite through it demotes the
+    column and drops ``edges`` from the block it regenerates (#588). Losing the
+    edge interpretation silently changes the shapes -- great-circle edges read
+    as straight lines over the same bytes -- so both carriers are restored:
+
+    * the ``geo`` block's ``edges``, mapped to what the block's version can
+      say (:func:`_edges_for_output_version`);
+    * the Parquet logical type, retyped from GEOMETRY to GEOGRAPHY with the
+      same CRS and the edge algorithm (#999). Restoring only the block left a
+      2.0 output whose block said spherical over a planar column, which
+      ``check spec`` reports. A 1.x output has no logical type to retype.
+
+    Both go into the footer in one ``patch_footer`` call: the data pages are
+    the same WKB either way, so nothing below the footer is re-encoded. The
+    block-only rewrite this replaced cost a full pass and lost the compression
+    level; it stays as the fallback for a footer that cannot be read.
+
+    A retyped column gets its bounding boxes back (#1272): the row-group
+    GeospatialStatistics and the block's ``bbox`` were vertex boxes on a plane,
+    which a geodesic edge can leave, so each is replaced with a bound computed
+    over the edges (``core/geodesic_bbox``) rather than dropped as #1254 did.
+    When nothing can bound a column, the drop remains the fallback, and the
+    block's planar ``bbox`` goes with it. A column with non-planar edges that
+    is *not* retyped -- every 1.x output, or a 2.0 column that is not a
+    top-level GEOMETRY -- gets the geodesic block ``bbox`` only: it has no
+    GEOGRAPHY statistics to patch (and ``patch_footer`` only replaces a box
+    DuckDB wrote, it never adds one). A bbox covering column is per-row data,
+    not footer, and stays the vertex box it was written as.
+
+    ``pending_geo`` is the ``geo`` block the V2 M/ZM repair deferred to this
+    patch (#1270): the block the output needs but does not yet carry, taken in
+    place of the file's own and written whether or not the edges change it, so
+    the repair and the retype cost one below-the-footer copy instead of two.
     """
-    if not edges_by_col:
+    if not edges_by_col and pending_geo is None:
         return
 
-    pf = pq.ParquetFile(output_file)
-    try:
-        kv = pf.metadata.metadata or {}
-        if b"geo" not in kv:
-            warn(
-                "Input declares non-planar edges but output has no geo metadata "
-                f"to carry them ({', '.join(sorted(edges_by_col))}). Edge "
-                "interpretation is lost; avoid parquet-geo-only for geography data."
-            )
-            return
-        geo_meta = json.loads(kv[b"geo"].decode("utf-8"))
-    finally:
-        # Release the read handle before rewriting (Windows requires it).
-        pf.close()
+    geo_meta = pending_geo if pending_geo is not None else _read_geo_key(output_file)
+    geo_version = str((geo_meta or {}).get("version") or "")
+    edges_by_col = {
+        name: _edges_for_output_version(edges, geo_version) for name, edges in edges_by_col.items()
+    }
+    geography = _geography_candidates(output_file, edges_by_col)
+    targets = {**_block_bbox_targets(geo_meta, edges_by_col, geography), **geography}
+    bounds = _geodesic_bounds(output_file, targets, geo_meta)
+    geography_bbox = {name: bounds[name].per_group for name in geography if name in bounds}
+    file_bboxes = {name: b.file_bbox for name, b in bounds.items() if b.file_bbox is not None}
+    geo_updates = _geo_block_updates(
+        geo_meta,
+        edges_by_col,
+        file_bboxes,
+        force=pending_geo is not None,
+        unbounded=set(targets) - set(file_bboxes),
+    )
+    # A 1.x output has no GEOGRAPHY type to carry the edges, so a GeoArrow
+    # column's embedded Arrow schema is stamped instead, or it says planar.
+    arrow_edges = edges_by_col if geo_version.startswith("1.") else None
 
-    geo_version = str(geo_meta.get("version") or "")
-    changed = False
+    try:
+        retyped = patch_footer(
+            output_file,
+            geo_updates,
+            geography=geography,
+            geography_bbox=geography_bbox,
+            arrow_edges=arrow_edges,
+            verbose=verbose,
+        )
+    except FooterPatchRaced:
+        # Nothing was written, and a rewrite now would describe another
+        # writer's bytes (see _ensure_v2_geo_metadata).
+        raise
+    except FooterPatchUnsupported as exc:
+        retyped = []
+        warn(f"{exc}. Edge columns stay planar in the Parquet schema.")
+        if geo_updates:
+            _rewrite_file_with_geo_metadata(
+                output_file,
+                json.loads(geo_updates["geo"]),
+                compression,
+                compression_level,
+                row_group_rows,
+            )
+
+    if geo_meta is None and not retyped and not _already_geography(output_file, edges_by_col):
+        warn(
+            "Input declares non-planar edges but output has no geo metadata or "
+            f"GEOGRAPHY column to carry them ({', '.join(sorted(edges_by_col))}). "
+            "Edge interpretation is lost."
+        )
+    elif verbose:
+        debug(
+            f"Kept non-planar edges for {', '.join(sorted(edges_by_col))}"
+            + (f"; retyped GEOGRAPHY: {', '.join(retyped)}" if retyped else "")
+        )
+
+
+def _already_geography(output_file: str, edges_by_col: dict[str, str]) -> bool:
+    """Whether every edge column is already a GEOGRAPHY, so its type carries the edges."""
+    geography = {
+        col["name"]
+        for col in root_schema_columns(get_schema_info(output_file))
+        if "GeographyType" in (col.get("logical_type") or "")
+    }
+    return set(edges_by_col) <= geography
+
+
+def _geography_candidates(output_file: str, edges_by_col: dict[str, str]) -> dict[str, str]:
+    """The columns that may be retyped GEOGRAPHY: a Parquet edge algorithm and a geographic CRS.
+
+    Parquet's GEOGRAPHY requires a geographic CRS, so a column whose CRS is
+    projected keeps its planar GEOMETRY type, as it did before #999, and says
+    why; a ``geo`` block still carries what the input declared, which
+    ``check spec`` warns about on its own (#601). No CRS is OGC:CRS84.
+    """
+    geography: dict[str, str] = {}
+    candidates = {name: e for name, e in edges_by_col.items() if e in EDGE_ALGORITHMS}
+    if not candidates:
+        return geography
+    # Only a top-level GEOMETRY can be retyped; a 1.x output's WKB has no type.
+    planar = {
+        col["name"]
+        for col in root_schema_columns(get_schema_info(output_file))
+        if "GeometryType" in (col.get("logical_type") or "")
+    }
+    for name, edges in candidates.items():
+        if name not in planar:
+            continue
+        crs = extract_crs_from_parquet(output_file, geometry_column=name)
+        if isinstance(crs, str):
+            crs = parse_crs_string_to_projjson(crs) or crs
+        if is_geographic_crs(crs):
+            geography[name] = edges
+        else:
+            warn(
+                f"Kept column '{name}' a planar GEOMETRY in the Parquet schema: "
+                f"GEOGRAPHY requires a geographic CRS, and {get_crs_display_name(crs)} "
+                f"is not one, so the type cannot carry edges: {edges}."
+            )
+    return geography
+
+
+def _read_geo_key(output_file: str) -> dict | None:
+    """The output's ``geo`` block, or None when it has none."""
+    # Closed before the patch replaces the file (Windows requires it).
+    with pq.ParquetFile(output_file) as pf:
+        raw = (pf.metadata.metadata or {}).get(b"geo")
+    return json.loads(raw.decode("utf-8")) if raw else None
+
+
+def _block_bbox_targets(
+    geo_meta: dict | None, edges_by_col: dict[str, str], geography: dict[str, str]
+) -> dict[str, str]:
+    """Columns not being retyped whose ``geo`` block ``bbox`` still needs geodesic bounds.
+
+    Any column the block describes with non-planar edges and a geographic CRS
+    (none means OGC:CRS84): its vertex ``bbox`` under-covers the edges as much
+    as a GEOGRAPHY column's statistics would.
+    """
+    columns = (geo_meta or {}).get("columns") or {}
+    targets = {}
     for name, edges in edges_by_col.items():
-        edges = _edges_for_output_version(edges, geo_version)
-        col_meta = geo_meta.get("columns", {}).get(name)
+        col_meta = columns.get(name)
+        if name in geography or not isinstance(col_meta, dict):
+            continue
+        if edges != "spherical" and edges not in ELLIPSOIDAL_ALGORITHMS:
+            continue
+        if is_geographic_crs(col_meta.get("crs")):
+            targets[name] = edges
+    return targets
+
+
+def _geodesic_bounds(
+    output_file: str, targets: dict[str, str], geo_meta: dict | None
+) -> dict[str, ColumnBounds]:
+    """Geodesic row-group and file-level bounds for ``targets`` (``{column: edges}``).
+
+    Best-effort: a column whose bounds cannot be computed falls back to #1254's
+    behavior -- its planar boxes are dropped -- rather than failing the write,
+    and says so. A read error degrades; running out of memory does not.
+    """
+    if not targets:
+        return {}
+    import pyarrow as pa
+    from pyproj.exceptions import CRSError, GeodError
+
+    columns = (geo_meta or {}).get("columns") or {}
+    orientations = {
+        name: (columns.get(name) or {}).get("orientation")
+        for name in targets
+        if isinstance(columns.get(name), dict)
+    }
+    ellipsoids = {
+        name: ellipsoid_for_crs(extract_crs_from_parquet(output_file, geometry_column=name))
+        for name, edges in targets.items()
+        if edges in ELLIPSOIDAL_ALGORITHMS
+    }
+    try:
+        bounds = geography_statistics(
+            output_file, targets, orientations=orientations, ellipsoids=ellipsoids
+        )
+    except MemoryError:
+        raise
+    except (OSError, ValueError, ArithmeticError, pa.ArrowException, CRSError, GeodError) as e:
+        warn(
+            f"Could not compute geodesic bounding boxes for {', '.join(sorted(targets))} "
+            f"({e}); their bounding boxes are dropped, which only gives up row-group pruning."
+        )
+        return {}
+    for name, column_bounds in bounds.items():
+        if column_bounds.unreadable_groups:
+            warn(
+                f"Column '{name}': {column_bounds.unreadable_groups} row group(s) hold geometry "
+                "gpio cannot bound geodesically (unreadable WKB, or a non-finite or "
+                "out-of-range coordinate); their bounding boxes, and the file's, are dropped, "
+                "which only gives up row-group pruning."
+            )
+    return bounds
+
+
+def _bbox_with_geodesic_xy(existing: object, box: tuple) -> list[float]:
+    """A ``geo`` block ``bbox`` with the geodesic X/Y bounds, Z kept if it had one."""
+    xmin, ymin, xmax, ymax = box
+    if isinstance(existing, list) and len(existing) == 6:
+        return [xmin, ymin, existing[2], xmax, ymax, existing[5]]
+    return [xmin, ymin, xmax, ymax]
+
+
+def _geo_block_updates(
+    geo_meta: dict | None,
+    edges_by_col: dict[str, str],
+    file_bboxes: dict[str, tuple],
+    force: bool = False,
+    unbounded: Collection[str] = (),
+) -> dict[str, str]:
+    """``{"geo": <block>}`` with edges and geodesic bboxes set, or ``{}``.
+
+    ``force`` writes the block even unchanged -- the #1270 deferred repair's
+    block is not in the file yet, so "unchanged" still has to land.
+    ``unbounded`` names columns whose edges no geodesic box could be computed
+    for: their planar ``bbox`` is removed rather than left to under-cover.
+    """
+    changed = False
+    columns = (geo_meta or {}).get("columns") or {}
+    for name, edges in edges_by_col.items():
+        col_meta = columns.get(name)
         if isinstance(col_meta, dict) and col_meta.get("edges") != edges:
             col_meta["edges"] = edges
             changed = True
-
-    if not changed:
-        return
-
-    _rewrite_file_with_geo_metadata(
-        output_file, geo_meta, compression, compression_level, row_group_rows
-    )
-    # Neutral wording: the input may have declared edges via metadata only,
-    # without ever having a native GEOGRAPHY logical type.
-    warn(
-        "Preserved non-planar edges declaration in geo metadata for: "
-        f"{', '.join(sorted(edges_by_col))}. Note: DuckDB has no geography "
-        "type, so any native GEOGRAPHY input is rewritten as GEOMETRY (the "
-        "edges metadata carries the interpretation)."
-    )
+    for name, box in file_bboxes.items():
+        col_meta = columns.get(name)
+        if not isinstance(col_meta, dict):
+            continue
+        bbox = _bbox_with_geodesic_xy(col_meta.get("bbox"), box)
+        if col_meta.get("bbox") != bbox:
+            col_meta["bbox"] = bbox
+            changed = True
+    for name in unbounded:
+        col_meta = columns.get(name)
+        if isinstance(col_meta, dict) and "bbox" in col_meta:
+            del col_meta["bbox"]
+            changed = True
+    if geo_meta is None or not (changed or force):
+        return {}
+    return {"geo": json.dumps(geo_meta)}
 
 
 def _ensure_v2_geo_metadata(
@@ -230,7 +491,8 @@ def _ensure_v2_geo_metadata(
     row_group_rows: int | None = None,
     verbose: bool = False,
     primary_column: str | None = None,
-) -> None:
+    defer: bool = False,
+) -> dict | None:
     """Attach GeoParquet 2.0 geo metadata if the writer omitted it (#589).
 
     DuckDB 1.5.4's V2 writer skips the geo KV metadata for M/ZM geometries;
@@ -252,10 +514,19 @@ def _ensure_v2_geo_metadata(
     This lives here rather than beside the derivation because
     ``derive_geo_from_file`` sits below ``parquet_footer`` in the import
     layering; the funnel is the only caller either way.
+
+    With ``defer`` the derived block is returned instead of patched: an edges
+    patch is about to rewrite the same footer, and folding the key into that
+    one ``patch_footer`` call halves the post-write I/O (#1270). Returns the
+    pending block then, ``None`` otherwise.
     """
     geo_meta = derive_v2_geo_metadata(output_path, primary_column=primary_column)
     if geo_meta is None:
-        return
+        return None
+    if defer:
+        if verbose:
+            debug("Deferring the omitted geo metadata to the edges footer patch")
+        return geo_meta
 
     try:
         patch_footer_kv(output_path, {"geo": json.dumps(geo_meta)}, verbose=verbose)
@@ -275,6 +546,7 @@ def _ensure_v2_geo_metadata(
         debug(
             f"Wrote the geo metadata the writer omitted or mislabelled: {geo_meta['primary_column']!r} is primary"
         )
+    return None
 
 
 def _plain_copy_to(
@@ -291,7 +563,9 @@ def _plain_copy_to(
     carry_geo_metadata: dict | None = None,
     extra_kv_metadata: dict[str, str] | None = None,
     memory_limit: str | None = None,
-) -> None:
+    defer_v2_geo_repair: bool = False,
+    secondary_geo_columns: dict | None = None,
+) -> dict | None:
     """
     Execute a plain DuckDB COPY TO without geo metadata manipulation.
 
@@ -328,6 +602,16 @@ def _plain_copy_to(
             None means a default with headroom under the machine's memory
             ceiling -- never DuckDB's own 80%, which the allocations DuckDB
             makes outside its limit carry past a cgroup cap (#1153).
+        defer_v2_geo_repair: Hand the V2 geo repair's block back to the caller
+            instead of patching it here, because the caller is about to patch
+            the same footer for non-planar edges and one ``patch_footer`` call
+            can carry both (#1270).
+        secondary_geo_columns: The ``geo.columns`` entries the secondaries'
+            CRS comes from, so a 2.0 type carries each one's own CRS.
+
+    Returns:
+        The repair's pending ``geo`` block when ``defer_v2_geo_repair`` asked
+        for it and the output needs one; ``None`` otherwise.
     """
     compression_map = {
         "zstd": "ZSTD",
@@ -346,7 +630,10 @@ def _plain_copy_to(
 
     # DuckDB 1.5+: Apply CRS via ST_SetCRS so it's written natively into the
     # Parquet schema during COPY TO — no post-processing file rewrite needed.
-    final_query = _wrap_query_with_crs(query, geometry_column, input_crs)
+    final_query = _wrap_query_with_crs(query, geometry_column, input_crs, geoparquet_version)
+    final_query = wrap_query_with_secondary_crs(
+        con, final_query, secondary_geo_columns, geometry_column, geoparquet_version
+    )
 
     # Build options list
     options = [
@@ -389,14 +676,16 @@ def _plain_copy_to(
     # silently degrades to parquet-geo-only, so repair it from the file's own
     # native geospatial statistics (#589). When it does write the block, it
     # names the first geometry column primary, which the same repair corrects.
+    pending_v2_geo = None
     if duckdb_version == "V2":
-        _ensure_v2_geo_metadata(
+        pending_v2_geo = _ensure_v2_geo_metadata(
             output_path,
             compression=duckdb_compression,
             compression_level=compression_level,
             row_group_rows=row_group_rows,
             verbose=verbose,
             primary_column=geometry_column,
+            defer=defer_v2_geo_repair,
         )
 
     if verbose:
@@ -407,6 +696,7 @@ def _plain_copy_to(
         # `Could not move file: Access is denied` (#1023, #1032).
         with pq.ParquetFile(output_path) as pf:
             success(f"Wrote {pf.metadata.num_rows:,} rows to {output_path}")
+    return pending_v2_geo
 
 
 def _custom_covering_survives(covering, original_metadata, geometry_column, output_columns) -> bool:
@@ -719,9 +1009,12 @@ def _fast_path_geo_decision(
     Both answers are ``(None, False)`` — "let DuckDB write its own block on the
     fast path" — when the version is not 2.0 (1.x already rewrites), when the
     input resolves to more than one file (see below), or when the carried block
-    says nothing DuckDB would not write itself.
+    says nothing DuckDB would not write itself. The one exception is an unknown
+    ``input_crs`` with no carried block to state it: DuckDB's block would omit
+    ``crs`` and so claim OGC:CRS84, so that write is sent to the rewrite
+    (``(None, True)``, #1276).
 
-    The second answer is ``True`` only when the block IS worth keeping and still
+    Otherwise the second answer is ``True`` only when the block IS worth keeping and still
     cannot be written verbatim, because a caller invalidated the derived stats and
     nothing here can recompute them. The fast path cannot merge: it replaces
     DuckDB's whole ``geo`` key with what this returns, so a block missing
@@ -735,8 +1028,14 @@ def _fast_path_geo_decision(
     gate is: until that step has run, there is no telling whether the block has
     anything the fast path would lose.
     """
-    if effective_version != "2.0" or not geometry_column or not original_metadata:
+    if effective_version != "2.0" or not geometry_column:
         return None, False
+    # DuckDB's own 2.0 block omits `crs`, which reads as OGC:CRS84. An unknown
+    # CRS with no carried block to say so takes the rewrite, which writes
+    # `crs: null` (#1276).
+    no_block = (None, is_unknown_type_crs(input_crs))
+    if not original_metadata:
+        return no_block
 
     # A glob/directory input merges several files, but `original_metadata` was
     # read from the FIRST file's footer only. Carrying its bbox/geometry_types
@@ -749,7 +1048,7 @@ def _fast_path_geo_decision(
                 "Not carrying the input's geo block: a multi-file input's merged "
                 "stats cannot come from the first file's footer"
             )
-        return None, False
+        return no_block
 
     # A write-path reader in the strongest sense: whatever comes back is written
     # to the output file verbatim, so the block goes through the shared shape
@@ -757,10 +1056,10 @@ def _fast_path_geo_decision(
     # `'list' object has no attribute 'get'` on the next line (#947).
     geo_dict = sanitized_carried_geo(original_metadata)
     if not geo_dict:
-        return None, False
+        return no_block
     col_meta = (geo_dict.get("columns") or {}).get(geometry_column)
     if not isinstance(col_meta, dict):
-        return None, False
+        return no_block
     carried = copy.deepcopy(geo_dict)
     carried["version"] = "2.0.0"
     # Before the gate: a block whose only extra key was a default or null
@@ -859,6 +1158,30 @@ def _query_geometry_is_already_native(con, query: str, geometry_column: str | No
     col_type = _get_query_column_type(con, query, geometry_column)
     return bool(col_type) and not col_type.upper().startswith(
         ("GEOMETRY", "GEOGRAPHY", "BLOB", "VARCHAR")
+    )
+
+
+def _secondary_geo_columns(carried_geo_block: dict | None, geometry_info: dict | None):
+    """The ``geo.columns`` entries the write's secondary CRS comes from."""
+    return (carried_geo_block or {}).get("columns") or (geometry_info or {}).get("metadata")
+
+
+def _unknown_secondary_needs_rewrite(
+    carried_geo_block: dict | None,
+    secondary_geo_columns: dict | None,
+    geometry_column: str | None,
+    effective_version: str,
+) -> bool:
+    """Whether an unknown secondary CRS sends a 2.0 fast-path write to the rewrite.
+
+    DuckDB's own 2.0 block omits the ``crs`` of a ``srid:0`` column, which reads
+    as OGC:CRS84. With no carried block to say ``crs: null`` for an unknown
+    secondary, the rewrite writes it (#1277 review).
+    """
+    return (
+        carried_geo_block is None
+        and effective_version == "2.0"
+        and has_unknown_secondary(secondary_geo_columns, geometry_column)
     )
 
 
@@ -1114,6 +1437,10 @@ def write_parquet_with_metadata(
         # DuckDB instead. Merged after the "says more than DuckDB" gate, so a
         # secondary's own `crs` cannot by itself make a block worth carrying.
         merge_secondary_geometry_metadata(carried_geo_block, geometry_info)
+    secondary_geo_columns = _secondary_geo_columns(carried_geo_block, geometry_info)
+    rewrite_needed = rewrite_needed or _unknown_secondary_needs_rewrite(
+        carried_geo_block, secondary_geo_columns, geometry_column, effective_version
+    )
 
     # Preserve non-geo KV metadata from input (e.g., vecorel, fiboa).
     # Build a merged local dict rather than mutating the caller-supplied
@@ -1141,6 +1468,14 @@ def write_parquet_with_metadata(
     if extra_kv_metadata and verbose:
         debug(f"Carrying extra KV metadata: {list(extra_kv_metadata.keys())}")
 
+    # Which columns' non-planar edges this write must restore afterwards (#588).
+    # Asked before the write so the fast path can fold the V2 M/ZM geo repair
+    # into the edges footer patch when both are coming (#1270); the answer only
+    # reads the input, which the write does not change.
+    edges_to_restore = _edges_to_restore(
+        input_file, original_metadata, exclude_columns=drop_nonplanar_edges_columns
+    )
+
     if show_sql:
         info("\n-- Query:")
         progress(query)
@@ -1163,7 +1498,7 @@ def write_parquet_with_metadata(
             # that is certain, rather than let the footer be the first to tell
             # the user (#986).
             note_duckdb_copy_rounding(row_group_rows)
-            _plain_copy_to(
+            pending_v2_geo = _plain_copy_to(
                 con=con,
                 query=query,
                 output_path=actual_output,
@@ -1177,8 +1512,13 @@ def write_parquet_with_metadata(
                 carry_geo_metadata=carried_geo_block,
                 extra_kv_metadata=extra_kv_metadata,
                 memory_limit=memory_limit,
+                # An edges patch is coming: one patch_footer call carries the
+                # M/ZM geo repair and the retype together (#1270).
+                defer_v2_geo_repair=bool(edges_to_restore),
+                secondary_geo_columns=secondary_geo_columns,
             )
         else:
+            pending_v2_geo = None
             # Metadata rewrite needed - use strategy pattern
 
             # 1.1-geoarrow produces native GeoArrow encoding from WKB/text inputs,
@@ -1258,16 +1598,17 @@ def write_parquet_with_metadata(
         # regenerates geo metadata without `edges`, silently demoting geography
         # data to planar. Runs on the local temp file, so remote outputs are
         # patched before upload. Columns whose declaration this write
-        # invalidated (#601) are excluded rather than re-attached.
-        _preserve_edges_after_write(
-            input_file,
-            original_metadata,
+        # invalidated (#601) were excluded at collection rather than
+        # re-attached. The fast path's deferred V2 geo repair rides along, so
+        # both edits cost one footer patch (#1270).
+        apply_nonplanar_edges(
+            edges_to_restore,
             actual_output,
             compression=compression,
             compression_level=compression_level,
             row_group_rows=row_group_rows,
             verbose=verbose,
-            exclude_columns=drop_nonplanar_edges_columns,
+            pending_geo=pending_v2_geo,
         )
 
         # Auto-fix vecorel schema compliance when collection metadata is present
@@ -1284,37 +1625,66 @@ def write_parquet_with_metadata(
             )
 
 
-def _preserve_edges_after_write(
-    input_file: str | None,
-    original_metadata: dict | None,
-    output_path: str,
-    compression: str = "ZSTD",
-    compression_level: int | None = None,
-    row_group_rows: int | None = None,
-    verbose: bool = False,
-    exclude_columns: Collection[str] | None = None,
-) -> None:
-    """Restore non-planar edges dropped by the writer, on any rewrite path.
+def declared_nonplanar_edges(
+    input_file: str | None, original_metadata: dict | None
+) -> dict[str, str]:
+    """Map geometry column -> non-planar edges an input declares, from either carrier.
 
-    Prefers the input file (sees native GEOGRAPHY logical types as well as geo
-    metadata); falls back to the input's KV metadata dict when only that is
-    available (e.g. an Arrow stream read from stdin). ``exclude_columns`` names
-    columns whose declaration the write itself invalidated (#601): the input
-    still declares them, but they must not come back.
+    Prefers the input file, which sees native GEOGRAPHY logical types as well as
+    the ``geo`` block; falls back to the input's KV metadata dict when the file
+    says nothing or there is no re-readable file (an Arrow stream read from
+    stdin passes ``input_file=None``). One answer serves both the planar-repair
+    gate (#1287) and the edges a write restores (#588).
     """
     edges_by_col = collect_nonplanar_edges(input_file) if input_file else {}
-    if not edges_by_col:
-        edges_by_col = _collect_nonplanar_edges_from_metadata(original_metadata)
+    return edges_by_col or _collect_nonplanar_edges_from_metadata(original_metadata)
+
+
+def _edges_to_restore(
+    input_file: str | None,
+    original_metadata: dict | None,
+    exclude_columns: Collection[str] | None = None,
+) -> dict[str, str]:
+    """The non-planar edges the writer will drop and the write must restore.
+
+    The input's declaration (:func:`declared_nonplanar_edges`), less
+    ``exclude_columns``: columns whose declaration the write itself invalidated
+    (#601). The input still declares them, but they must not come back.
+
+    Collection only; :func:`apply_nonplanar_edges` writes the answer back
+    after the write, on any rewrite path.
+    """
+    edges_by_col = declared_nonplanar_edges(input_file, original_metadata)
     if exclude_columns:
         edges_by_col = {k: v for k, v in edges_by_col.items() if k not in exclude_columns}
-    _apply_nonplanar_edges(
-        edges_by_col,
-        output_path,
-        compression=compression,
-        compression_level=compression_level,
-        row_group_rows=row_group_rows,
-        verbose=verbose,
-    )
+    return edges_by_col
+
+
+def table_nonplanar_edges(table, geometry_column: str, edges: str | None) -> dict[str, str]:
+    """Map geometry column -> non-planar edges an in-memory table declares.
+
+    The one reader of a table's edges (the repair gate's
+    ``geometry_repair.nonplanar_edges_of_arrow_table`` is a view of it). The
+    caller's ``edges`` wins for the primary, then the carried ``geo`` block,
+    then a GeoArrow field's own edge type. A block that states ``edges`` wins
+    over the type when they disagree, ``"planar"`` included. A block without
+    ``edges`` says nothing, so the type decides. Only a GeoParquet edge
+    algorithm (``GEOGRAPHY_EDGE_ALGORITHMS``) counts as a declaration, so a
+    typo falls through to the type (#1288). An explicit ``"planar"`` from the
+    caller is a choice too, so it drops the primary. The table is the only
+    witness the Arrow funnel has, since it never sees the input file.
+    """
+    edges_by_col = nonplanar_edges_from_schema(table.schema)
+    for name, declared in _block_edges(table.schema.metadata).items():
+        if declared == "planar":
+            edges_by_col.pop(name, None)
+        elif declared in GEOGRAPHY_EDGE_ALGORITHMS:
+            edges_by_col[name] = declared
+    if edges == "planar":
+        edges_by_col.pop(geometry_column, None)
+    elif edges:
+        edges_by_col[geometry_column] = edges
+    return {name: e for name, e in edges_by_col.items() if name in table.column_names}
 
 
 def _auto_fix_vecorel_if_needed(
@@ -1419,6 +1789,14 @@ def write_geoparquet_table(
     # Normalize large_string/large_binary back to string/binary for Parquet compatibility
     table = _normalize_arrow_large_types(table)
 
+    # Read before the metadata pass rebuilds the column: a 1.x write strips the
+    # GeoArrow edge type, and a 2.0 one regenerates a block without `edges`.
+    edges_by_col = table_nonplanar_edges(table, geometry_column, edges) if has_geometry else {}
+    if has_geometry and edges == "planar":
+        # An explicit planar choice also clears a native GEOGRAPHY type, which
+        # a 2.0 write would otherwise keep as spherical.
+        table = with_planar_edge_types(table, [geometry_column])
+
     # No AWS_PROFILE env mutation here: the write target inside this block is a
     # local (temp) file, and the upload at the end is credentialed by passing
     # profile= straight through to upload().
@@ -1452,6 +1830,18 @@ def write_geoparquet_table(
             row_group_size_mb=row_group_size_mb,
             geoparquet_version=geoparquet_version,
             geometry_column=geometry_column,
+            verbose=verbose,
+        )
+
+        # The DuckDB-query funnel restores edges in `_preserve_edges_after_write`.
+        # This is the same step for a table: the block's `edges` and, at 2.0,
+        # the GEOGRAPHY logical type, so the two never disagree (#1269).
+        apply_nonplanar_edges(
+            edges_by_col,
+            actual_output,
+            compression=validated_compression or "UNCOMPRESSED",
+            compression_level=validated_level,
+            row_group_rows=row_group_rows,
             verbose=verbose,
         )
 

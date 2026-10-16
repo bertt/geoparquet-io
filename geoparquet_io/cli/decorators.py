@@ -379,6 +379,19 @@ def overwrite_option(func):
     return click.option("--overwrite", is_flag=True, help="Overwrite existing files")(func)
 
 
+def strict_option(func):
+    """
+    Add --strict option to a ``check`` command.
+
+    A failure always exits 1; ``--strict`` makes a warning exit 1 as well.
+    """
+    return click.option(
+        "--strict",
+        is_flag=True,
+        help="Exit 1 on warnings as well as failures (a failure always exits 1)",
+    )(func)
+
+
 def _validate_column_name(ctx, param, value):
     """Reject an empty or whitespace-only value for an option naming a column.
 
@@ -594,7 +607,7 @@ def aws_profile_option(func):
     """Add hidden --aws-profile option (now a global option)."""
     return click.option(
         "--aws-profile",
-        help="AWS profile name for S3 operations (sets AWS_PROFILE env var)",
+        help="AWS profile name for S3 operations",
         hidden=True,
     )(func)
 

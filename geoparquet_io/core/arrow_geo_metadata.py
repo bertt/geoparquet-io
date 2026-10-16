@@ -24,13 +24,16 @@ from geoparquet_io.core.bbox_structure import _bbox_column_from_covering
 from geoparquet_io.core.crs_utils import (
     _format_crs_display,
     apply_output_crs,
+    field_type_crs_is_unknown,
     is_default_crs,
+    is_empty_crs_value,
     parse_geo_metadata_from_schema,
 )
+from geoparquet_io.core.duckdb_utils import geoarrow_field_edges, planar_view
 from geoparquet_io.core.geo_metadata import (
     DEFAULT_GEOPARQUET_VERSION,
+    GEOGRAPHY_EDGE_ALGORITHMS,
     GEOPARQUET_VERSIONS,
-    OVERVIEWS_KEY,
     _bbox_claimed_by_another_column,
     _get_geometry_type_name,
     _self_evident_bbox_column,
@@ -50,8 +53,11 @@ from geoparquet_io.core.geoarrow_encoding import (
 )
 from geoparquet_io.core.logging_config import debug, success
 from geoparquet_io.core.parquet_writer import (
+    _CARRIED_SCHEMA_METADATA_KEYS_BYTES,
     ParquetWriteSettings,
+    apply_output_kv_metadata,
     estimate_row_size,
+    output_schema_metadata,
     resolve_row_group_rows_for_table,
 )
 from geoparquet_io.core.write_strategies.base import (
@@ -275,10 +281,70 @@ def _crs_as_projjson(crs):
         return None
 
 
+def _secondary_crs_from_field(field) -> dict:
+    """The ``crs`` key a secondary's GeoArrow type gives its ``geo`` entry.
+
+    ``{"crs": None}`` for an unknown CRS, the ``srid:0`` type or an empty
+    value, which PROJ cannot parse and the default must not swallow (#1277
+    review). ``{}`` for the default, which the spec states by omitting the key
+    (``apply_output_crs`` is where that rule lives for the primary). Otherwise
+    the PROJJSON the type names.
+    """
+    if field_type_crs_is_unknown(field):
+        return {"crs": None}
+    crs = _crs_as_projjson(getattr(field.type, "crs", None))
+    if is_empty_crs_value(crs):
+        return {"crs": None}
+    if isinstance(crs, dict) and not is_default_crs(crs):
+        return {"crs": crs}
+    return {}
+
+
 def _is_spherical_edge_type(arrow_type) -> bool:
     """Whether a GeoArrow extension type declares spherical edges."""
     edge_type = getattr(arrow_type, "edge_type", None)
     return getattr(edge_type, "name", "").upper() == "SPHERICAL"
+
+
+# One reader of a field's edges, shared with the DuckDB registration step (#1253).
+_field_edges = geoarrow_field_edges
+
+
+def nonplanar_edges_from_schema(schema) -> dict[str, str]:
+    """Map each GeoArrow field with non-planar edges to its edges value.
+
+    A table read from a native GEOGRAPHY file says its edges in the field type
+    (or, when ``geoarrow.pyarrow`` is not imported, in the field's extension
+    metadata), not in a ``geo`` block. The write paths that rebuild the block
+    need this to carry the edges over (#1269, #1253).
+
+    The type carrier only. Only a GeoParquet edge algorithm
+    (``GEOGRAPHY_EDGE_ALGORITHMS``) counts (#1288). What a table declares once
+    its ``geo`` block is weighed too is ``write_funnels.table_nonplanar_edges``.
+    """
+    edges_by_col: dict[str, str] = {}
+    for field in schema:
+        if not is_geoarrow_extension_field(field):
+            continue
+        edges = _field_edges(field)
+        if edges in GEOGRAPHY_EDGE_ALGORITHMS:
+            edges_by_col[field.name] = edges
+    return edges_by_col
+
+
+def with_planar_edge_types(table, columns=None):
+    """The table with each named GeoArrow column's edge type set to planar.
+
+    DuckDB refuses to register a GeoArrow column with non-planar edges ("Can't
+    import non-planar edges"), so a write that goes through DuckDB clears the
+    edge type first and restores it on the written file (#1253). The CRS and the
+    bytes are kept as they are. ``columns=None`` clears every GeoArrow column
+    whose type says anything but planar, a value gpio does not know included,
+    because DuckDB refuses those too. Which edges come back is the restore
+    side's question (``write_funnels.table_nonplanar_edges``). The relabel is
+    ``duckdb_utils.planar_view``, the same one ``register_arrow`` does.
+    """
+    return planar_view(table, columns=columns)[0]
 
 
 # What a secondary geometry column's carried entry says about the column ITSELF,
@@ -290,7 +356,9 @@ _DESCRIPTIVE_SECONDARY_KEYS = frozenset(
 )
 
 
-def table_geometry_info(table, primary_column: str, carried_geo: dict | None = None) -> dict | None:
+def table_geometry_info(
+    table, primary_column: str | None, carried_geo: dict | None = None
+) -> dict | None:
     """``geometry_info`` for an in-memory table whose caller supplied none.
 
     The table entry points -- ``write_geoparquet_table``, each strategy's
@@ -313,6 +381,8 @@ def table_geometry_info(table, primary_column: str, carried_geo: dict | None = N
     same answer, read off an in-memory table rather than a written file, which is
     the line between this module and that one.
 
+    ``primary_column=None`` includes every geometry field, for an input boundary
+    that must carry its complete description before DuckDB drops field types.
     Returns None when the table has no secondary geometry column.
     """
     declared = (carried_geo or {}).get("columns") or {}
@@ -339,11 +409,7 @@ def table_geometry_info(table, primary_column: str, carried_geo: dict | None = N
         # measure the real list treat as a gap (#952).
         col_meta.setdefault("geometry_types", [])
         if "crs" not in col_meta:
-            crs = _crs_as_projjson(getattr(field.type, "crs", None))
-            # The spec states the default by OMITTING the key; `apply_output_crs`
-            # is where that rule lives for the primary.
-            if isinstance(crs, dict) and not is_default_crs(crs):
-                col_meta["crs"] = crs
+            col_meta.update(_secondary_crs_from_field(field))
         # The schema carries the edge interpretation as well as the CRS: left
         # behind, a spherical secondary came out planar with no warning.
         if "edges" not in col_meta and _is_spherical_edge_type(field.type):
@@ -611,17 +677,10 @@ def _assemble_and_apply_geo_metadata(
     Returns:
         pa.Table: Table with geo metadata applied
     """
-    # Apply metadata to table
-    existing_metadata = dict(table.schema.metadata) if table.schema.metadata else {}
-    new_metadata = {}
-
-    # Copy non-geo metadata from existing
-    for k, v in existing_metadata.items():
-        key_str = k.decode("utf-8") if isinstance(k, bytes) else k
-        if not key_str.startswith("geo"):
-            new_metadata[k] = v
-
-    # Add geo metadata
+    # Keep the table's other keys under the facade's rule: the input's `pandas`,
+    # `ARROW:schema` and `geo:overviews` go, while a sidecar whose name only
+    # starts with "geo" stays. The `geo` key itself is replaced just below.
+    new_metadata = output_schema_metadata(table.schema.metadata, metadata_version)
     new_metadata[b"geo"] = json.dumps(geo_meta).encode("utf-8")
     table = table.replace_schema_metadata(new_metadata)
 
@@ -631,28 +690,9 @@ def _assemble_and_apply_geo_metadata(
     return table
 
 
-# Schema-metadata keys that describe the *input's* schema rather than the
-# output's, so they must never ride along into a write.
-#
-# `geo` would declare the input's GeoParquet version over output the writer has
-# just given a different shape; `ARROW:schema` and `pandas` are serialized
-# descriptors that pyarrow writes through verbatim rather than regenerating,
-# leaving the output naming the input's columns and CRS.
-#
-# One definition, used by both places that need it -- the parquet-geo-only path
-# below (which sees `bytes` keys, straight off a pyarrow schema) and
-# write_parquet_with_metadata's preserved-keys loop (which sees them decoded).
-# They were separate literals; a key added to one and not the other is a silent
-# metadata leak, so the bytes form is derived rather than written out again.
-# `geo:overviews` describes the file's own row-group layout (OVERVIEWS_SPEC
-# 3.1 calls it authoritative), so a rewrite that regroups or filters rows must
-# not carry it: an honest plain file with a `level` column beats a footer that
-# lies about where each level ends. The writer of a levelled file mints a fresh
-# one; nothing else may forward it.
-_CARRIED_SCHEMA_METADATA_KEYS = frozenset({"geo", "ARROW:schema", "pandas", OVERVIEWS_KEY})
-_CARRIED_SCHEMA_METADATA_KEYS_BYTES = frozenset(
-    key.encode("utf-8") for key in _CARRIED_SCHEMA_METADATA_KEYS
-)
+# The carried-key set (`_CARRIED_SCHEMA_METADATA_KEYS` and its bytes form) is
+# the write facade's now (`parquet_writer`), which applies it to every
+# Arrow-side write. Import it from there.
 
 
 def _strip_geo_metadata_key(table, verbose: bool = False):
@@ -1038,6 +1078,7 @@ def _write_table_with_settings(
     geoparquet_version: str | None,
     geometry_column: str,
     verbose: bool = False,
+    extra_kv_metadata: dict[str, str] | None = None,
 ) -> None:
     """
     Write Arrow table to Parquet with proper settings.
@@ -1056,6 +1097,8 @@ def _write_table_with_settings(
         geoparquet_version: GeoParquet version
         geometry_column: Name of the geometry column
         verbose: Whether to print verbose output
+        extra_kv_metadata: The caller's file-level keys. Passed again here so
+            this last pass does not drop a caller key named like a carried one
     """
     # The facade's row-group decision, including the MB -> rows sizing. Calling
     # it again after write_geoparquet_table already resolved is harmless and
@@ -1070,7 +1113,11 @@ def _write_table_with_settings(
         row_group_rows=row_group_rows,
         row_group_size_mb=row_group_size_mb,
     )
-    write_kwargs = settings.get_pyarrow_kwargs(calculated_row_group_size=rows_per_group)
+    write_kwargs = settings.get_pyarrow_kwargs(
+        calculated_row_group_size=rows_per_group,
+        schema=table.schema,
+        geometry_columns=[geometry_column],
+    )
 
     if verbose:
         compression_desc = (
@@ -1079,6 +1126,11 @@ def _write_table_with_settings(
         debug(f"Writing with {compression_desc} compression")
         if rows_per_group:
             debug(f"Row group size: {rows_per_group:,} rows")
+
+    # The facade has the last word on the file-level keys, here at the one
+    # place every Arrow-table write reaches: the table funnel and the helpers
+    # that call this directly never pass through a strategy (#1268).
+    table = apply_output_kv_metadata(table, geoparquet_version, extra_kv_metadata)
 
     # Use pq.write_table for all versions - we've already applied all metadata
     # Using geoarrow's write_geoparquet_table would overwrite our carefully constructed metadata
@@ -1130,7 +1182,9 @@ def _normalize_arrow_large_types(table):
     return table.cast(new_schema)
 
 
-def describe_wkb_geometry(table, geometry_column: str, crs: dict | str | None = None):
+def describe_wkb_geometry(
+    table, geometry_column: str, crs: dict | str | None = None, edges: str | None = None
+):
     """Attach a ``geo`` block naming ``geometry_column`` to a table that has none.
 
     A table built in memory from a query (``gpio.convert()``'s read) holds bare
@@ -1144,7 +1198,10 @@ def describe_wkb_geometry(table, geometry_column: str, crs: dict | str | None = 
     declares GeoParquet 1.1, which is what auto mode writes for a WKB table, and
     an empty ``geometry_types`` (the spec's "not known"). ``crs`` is the source's
     CRS as PROJJSON. ``None`` means the default (OGC:CRS84) and leaves the key
-    out, as the spec spells it.
+    out, as the spec spells it. ``edges`` is the source's declared edge
+    interpretation (e.g. ``"spherical"``); ``None`` or ``"planar"`` leaves the
+    key out (planar is the spec default). Dropping it would let the write read
+    great-circle edges as straight lines over the same bytes (#1287).
 
     A table that already has a ``geo`` key is returned unchanged.
     """
@@ -1155,6 +1212,8 @@ def describe_wkb_geometry(table, geometry_column: str, crs: dict | str | None = 
     column: dict = {"encoding": "WKB", "geometry_types": []}
     if crs is not None:
         column["crs"] = crs
+    if edges and edges != "planar":
+        column["edges"] = edges
     geo = {
         "version": GEOPARQUET_VERSIONS[DEFAULT_GEOPARQUET_VERSION]["metadata_version"],
         "primary_column": geometry_column,

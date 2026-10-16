@@ -327,11 +327,11 @@ table = ops.from_wfs('https://geo.example.com/wfs', 'cities', limit=100)
 | `service_url` | str | WFS service URL |
 | `typename` | str | Layer name to extract |
 | `version` | str | WFS version: `auto` (default), `2.0.0`, `1.1.0`, `1.0.0`. Auto tries 2.0.0 first. |
-| `bbox` | tuple | Bounding box filter (xmin, ymin, xmax, ymax) |
+| `bbox` | tuple | Bounding box filter (xmin, ymin, xmax, ymax), x,y, in the CRS requested from the layer (`output_crs`, else EPSG:4326, else the layer's default CRS). Not reprojected. When it looks like lon/lat on a projected layer, or matches nothing, a warning prints the box reprojected into the layer CRS as a hint. |
 | `limit` | int | Maximum number of features |
 | `max_workers` | int | Number of parallel fetch workers (default: 1) |
 | `page_size` | int | Features per WFS request page (default: 100000) |
-| `axis_order` | str | Bbox axis order: `auto` (default), `xy`, `latlon`. Auto detects from CRS format. |
+| `axis_order` | str | Bbox axis order: `auto` (default), `xy`, `latlon`. Pass the bbox x,y. `auto` picks the form from the layer CRS (CRS84 for lon/lat, lat,lon with the EPSG URN for other lat,lon CRSs). `xy` always sends x,y with the short `EPSG:<code>` label (CRS84 for lon/lat). `latlon` also sends a lon/lat bbox lat,lon. Ignored on WFS 1.0.0. |
 | `auto_tile` | bool | Auto-subdivide bbox when server caps response (default: True) |
 | `strict_crs` | bool | Fail when the server returns a different CRS than requested (default: False, warns and uses the server's actual CRS instead). gpio trusts the CRS the server declares in its GeoJSON response and never guesses from coordinates. |
 
@@ -768,6 +768,21 @@ WGS84, use `assume_crs84=True` to treat them as OGC:CRS84 and write the default
 table = gpio.read('unknown_crs.parquet').reproject(assume_crs84=True)
 ```
 
+If you know the real CRS of a file whose CRS is unknown, pass it as
+`source_crs` instead. A `srid:0` Parquet type reads as unknown the same way.
+
+```python
+table = gpio.read('unknown_crs.parquet').reproject(
+    target_crs='EPSG:4326', source_crs='EPSG:5070'
+)
+```
+
+Without that, `Table.write()` keeps an unknown CRS unknown. A 1.0 or 1.1
+output keeps `crs: null`, a 2.0 output keeps it and types the column `srid:0`,
+and a parquet-geo-only output types the column `srid:0`. An empty `crs` value
+such as `{}` reads as unknown, with a warning, and is written the same way.
+`table.crs` is `None` for both the default and an unknown CRS.
+
 #### `extract(columns=None, exclude_columns=None, bbox=None, where=None, limit=None)`
 
 Filter columns and rows.
@@ -821,6 +836,26 @@ themselves ([#1176](https://github.com/geoparquet/geoparquet-io/issues/1176)).
 A table with *no* geometry column is not the same thing, and still writes plain
 Parquet deliberately.
 
+**What `write()` keeps**
+
+`write()` keeps the input's non-geo file metadata (fiboa, vecorel, STAC
+fragments, your own keys), for a table from `gpio.read()` and from
+`gpio.convert()` alike
+([#1268](https://github.com/geoparquet/geoparquet-io/issues/1268)). The stale
+`pandas` and `ARROW:schema` blocks are dropped on purpose, and `geo` is rebuilt
+from the table. Non-planar edges are kept too. A native GEOGRAPHY table writes
+as a GEOGRAPHY at 2.0 and as `edges: spherical` in a 1.x `geo` block
+([#1253](https://github.com/geoparquet/geoparquet-io/issues/1253)). A
+`1.1-geoarrow` output also names the edges in its GeoArrow type, so an Arrow
+reader sees the same answer. No WKB geometry column, primary or secondary,
+is dictionary-encoded, on any `write_strategy` and any `geoparquet_version`
+([#1122](https://github.com/geoparquet/geoparquet-io/issues/1122)).
+
+```python
+gpio.convert('fields.parquet').write('out.parquet')  # keeps the fiboa key
+gpio.read('geography.parquet').write('out.parquet', geoparquet_version='2.0')
+```
+
 **Row group size**
 
 `row_group_rows` is resolved by the same write facade the CLI uses, so a number
@@ -873,6 +908,25 @@ table.write('output.parquet', write_strategy='streaming')
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `write_strategy` | str | Write strategy: `duckdb-kv` (default), `streaming`, `disk-rewrite`, or `in-memory` |
+
+Every strategy writes the same file-level keys. The `geo` block is built fresh
+for the output, and other keys such as fiboa, STAC or your own provenance key are
+kept. The input's `pandas`, `ARROW:schema` and `geo:overviews` keys are never
+copied, because they describe the input's rows and not the written ones. A stale
+`pandas` block made pandas give sorted rows the input's index labels, or shift a
+naive timestamp by a time zone the column no longer has. The CLI and the
+`duckdb-kv` and `disk-rewrite` strategies already worked this way. Before
+[#1268](https://github.com/geoparquet/geoparquet-io/issues/1268) the `in-memory`
+and `streaming` strategies and the Arrow-table writer copied the `pandas` key
+through. A named or non-range pandas index now reads back as a plain column, as
+it already did on the default strategy.
+
+The `pandas` key is always dropped, not only when the rows change. pyarrow uses
+it in `to_pandas()` to restore the index and nullable dtypes such as `Int64`, so
+even a plain `gpio.read(path).write(out)` loses them. An `Int64` column with
+nulls comes back as `float64`, and a named index comes back as a plain column.
+If you need a pandas round trip, write the file with geopandas `to_parquet`
+instead.
 
 DuckDB's memory limit is auto-detected and respects container cgroup limits. To
 set it explicitly, use the CLI `gpio extract --write-memory` flag; the Python
@@ -1082,6 +1136,11 @@ stats = table.partition_by_admin('output/', vecorel=True)
 ```
 
 ### Aggregation Methods {#aggregation}
+
+Aggregate and overview methods generate new geometry in OGC:CRS84 longitude
+and latitude, including when the input comes from a projected `gpio.convert()`
+table. Their results use that output CRS when written. Counts-only results
+have no geometry or CRS.
 
 #### `aggregate_a5(resolution, metric=None, breakdown=None, breakdown_limit=20, out_geometry='polygon', where=None, metric_nodata=None, bucket_point='geometry', bbox_column=None, breakdown_metric=None, memory_limit=None)`
 
@@ -1419,16 +1478,21 @@ ops.add_stac_metadata('items.parquet', 'collection.json')
 
 #### `check()` / `check_spatial()` / `check_compression()` / `check_bbox()` / `check_row_groups()`
 
-Run best-practice checks on the table.
+Run best-practice checks on the table. `check()` runs the structure checks
+(row groups, bbox and covering, compression, bloom filters); `gpio check all`
+also runs spatial order and spec validation, so for its exit code combine
+`check()`, `check_spatial()` and `validate()`.
 
 ```python
-# Run all checks
+# Run the structure checks
 result = table.check()
-if result.passed():
-    print("All checks passed!")
-else:
+if result.verdict() == "failure":
     for failure in result.failures():
         print(f"Failed: {failure}")
+
+# What `gpio check all` exits 1 on (`!= "pass"` for `--strict`)
+gate = [table.check(), table.check_spatial(), table.validate()]
+check_all_fails = any(r.verdict() == "failure" for r in gate)
 
 # Individual checks
 spatial_result = table.check_spatial()
@@ -1438,6 +1502,23 @@ row_group_result = table.check_row_groups()
 
 # Access results as dictionary
 details = result.to_dict()
+```
+
+`check_bbox()` also compares each row's bbox against its geometry's real
+envelope. A bbox smaller than its geometry fails the check — readers prune on
+the covering, so those rows go missing from spatial query results with no error
+anywhere — as do a NULL or NaN bbox and a geometry that is not valid WKB; one
+larger than its geometry is a warning (`verdict()` is `"warning"`). The
+comparison decodes a seeded sample of 5,000 rows drawn across the file by
+default, though it reads the geometry and bbox columns in full:
+
+```python
+bbox_result = table.check_bbox(all_rows=True)       # compare every row
+bbox_result = table.check_bbox(sample_rows=50000)   # wider sample
+bbox_result = table.check_bbox(sample_rows=0)       # structure and metadata only
+
+report = table.check_bbox().to_dict()['bbox_values']
+print(report['undersized_rows'], report['undersized_examples'])
 ```
 
 **Which bytes a check describes.** A table from `gpio.read(path)` is checked
@@ -2024,8 +2105,10 @@ from geoparquet_io import CheckResult
 
 # Methods
 result.passed()          # Returns True if all checks passed
-result.failures()        # List of failure messages
-result.warnings()        # List of warning messages
+result.verdict()         # "pass", "warning" or "failure" - what `gpio check` exits on
+                         # (exit 1 on "failure"; `verdict() != "pass"` is --strict)
+result.failures()        # Issues whose severity is "failure"
+result.warnings()        # Issues whose severity is "warning" (advice)
 result.recommendations() # List of recommendations
 result.to_dict()         # Full results as dictionary
 

@@ -28,13 +28,15 @@ from geoparquet_io.core.exceptions import (
 )
 from geoparquet_io.core.geo_metadata import sanitized_carried_geo
 from geoparquet_io.core.geoarrow_encoding import is_wkb_extension_field
+from geoparquet_io.core.geometry_repair import warn_planar_math, warn_planar_math_for_file
 from geoparquet_io.core.logging_config import debug, info, warn
 from geoparquet_io.core.optional_deps import load_module, require_coarsen
 from geoparquet_io.core.parquet_writer import (
     resolve_output_geoparquet_version,
     resolve_row_group_rows,
+    without_geometry_dictionary,
 )
-from geoparquet_io.core.write_funnels import write_geoparquet_table
+from geoparquet_io.core.write_funnels import table_nonplanar_edges, write_geoparquet_table
 
 #: Above this row count, coverage mode's whole-column materialization gets a
 #: memory warning (plain mode processes chunk by chunk).
@@ -291,6 +293,28 @@ def _with_stripped_geo(table: pa.Table, geometry_column: str) -> pa.Table:
     return table.replace_schema_metadata(metadata)
 
 
+def _with_carried_edges(table: pa.Table, geometry_column: str, edges: str | None) -> pa.Table:
+    """Keep the edges the input declared, in its type or its block (#1269).
+
+    Unwrapping the column to plain WKB drops its edge type, so the edges move
+    to the carried ``geo`` block, where a 1.x input already keeps them. The
+    write funnel then restores them on the output. ``edges`` is the answer of
+    ``table_nonplanar_edges``, which already let a stated block win (#1288).
+    """
+    if not edges:
+        return table
+    metadata = dict(table.schema.metadata or {})
+    geo = sanitized_carried_geo(metadata) or {
+        "version": "1.1.0",
+        "primary_column": geometry_column,
+        "columns": {},
+    }
+    columns = geo.setdefault("columns", {})
+    columns.setdefault(geometry_column, {"encoding": "WKB"})["edges"] = edges
+    metadata[b"geo"] = json.dumps(geo).encode("utf-8")
+    return table.replace_schema_metadata(metadata)
+
+
 def simplify_table(
     table: pa.Table,
     tolerance: float,
@@ -321,6 +345,8 @@ def simplify_table(
     if tolerance < 0:
         raise InvalidParameterError("tolerance", "must be >= 0")
     geom_col = _geometry_column_of(table, geometry_column)
+    warn_planar_math("simplify", table, geom_col)
+    declared_edges = table_nonplanar_edges(table, geom_col, None).get(geom_col)
     table = _with_wkb_storage(table, geom_col)
     column = table.column(geom_col)
     forward = inverse = None
@@ -381,7 +407,7 @@ def simplify_table(
         result = result.filter(pa.array(keep))
         row_bounds = row_bounds[np.array(keep)]
         info(f"dropped {sum(empty_flags)} empty geometries")
-    result = _with_stripped_geo(result, geom_col)
+    result = _with_carried_edges(_with_stripped_geo(result, geom_col), geom_col, declared_edges)
     return _refresh_bbox_covering(result, geom_col, bounds=row_bounds)
 
 
@@ -572,7 +598,10 @@ def _simplify_file_streaming(
             # written at open would shadow it on read. DuckDB-written GeoParquet
             # carries no ARROW:schema either, so readers already live without it.
             with pq.ParquetWriter(
-                write_target, writer_schema, store_schema=False, **writer_kwargs
+                write_target,
+                writer_schema,
+                store_schema=False,
+                **without_geometry_dictionary(writer_kwargs, schema, [geom_col]),
             ) as writer:
                 for batch in batches:
                     table = pa.Table.from_batches([batch])
@@ -762,6 +791,8 @@ def simplify_file(
                 input_parquet, output_parquet, tolerance, drop_columns=_drop_columns, **kwargs
             )
             return
+        # The in-memory branches run simplify_table, which warns itself.
+        warn_planar_math_for_file("simplify", input_parquet, geom_col)
         _simplify_file_streaming(
             pf,
             output_parquet,

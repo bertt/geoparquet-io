@@ -2498,12 +2498,21 @@ def from_wfs(
         typename: Feature type name (e.g., 'cities' or 'ns:cities')
         version: WFS version ('auto', '2.0.0', '1.1.0', '1.0.0'). Default 'auto'
             tries 2.0.0, then 1.1.0, then 1.0.0.
-        bbox: Optional bounding box filter (xmin, ymin, xmax, ymax)
+        bbox: Optional bounding box filter (xmin, ymin, xmax, ymax), x,y, in the
+            CRS requested from the layer (output_crs, else EPSG:4326, else the
+            layer's default CRS). It is not reprojected. When it looks like
+            lon/lat on a projected layer, or matches nothing, a warning prints
+            the box reprojected into the layer CRS as a hint.
         limit: Maximum features to fetch
         max_workers: Parallel requests for large datasets (default: 1)
         page_size: Features per page when using parallel mode (default: 100000)
-        axis_order: Bbox axis order ('auto', 'xy', 'latlon'). 'auto' detects from
-            CRS format - URN CRS with WFS 1.1.0+ uses lat,lon per OGC spec.
+        axis_order: Bbox axis order ('auto', 'xy', 'latlon'). Pass the bbox
+            x,y. 'auto' sends it in the form every server reads alike, CRS84
+            for lon/lat and lat,lon with the EPSG URN for other lat,lon CRSs
+            (EPSG:4258). 'xy' always sends x,y with the short EPSG:<code>
+            label (CRS84 for lon/lat). 'latlon' also sends a lon/lat bbox
+            lat,lon, for servers such as ArcGIS WFS that read every 4326 bbox
+            that way. Ignored on WFS 1.0.0, which reads x,y.
         strict_crs: If True, fail when the server returns a different CRS than
             requested. If False (default), warn and use the server's actual CRS.
             The CRS the server declares in its GeoJSON response is authoritative;
@@ -2573,7 +2582,7 @@ def from_wfs_layers(
         max_workers: Per-layer pagination workers (default: 1)
         page_size: Features per page (default: 100000)
         parallel_layers: Number of layers to extract concurrently (default: 1)
-        axis_order: Bbox axis order ('auto', 'xy', 'latlon')
+        axis_order: Bbox axis order ('auto', 'xy', 'latlon'), as in from_wfs
         strict_crs: If True, fail when the server returns a different CRS than requested
         auto_tile: Automatically subdivide into spatial tiles when the server
             caps responses (maxFeatures or startIndex limits). Matches the CLI

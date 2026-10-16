@@ -30,7 +30,7 @@ from geoparquet_io.core.crs_utils import (
     parse_crs_string_to_projjson,
     projjson_from_wkt,
 )
-from geoparquet_io.core.duckdb_utils import get_duckdb_connection, sql_path
+from geoparquet_io.core.duckdb_utils import get_duckdb_connection, sql_path, uses_aws_profile
 from geoparquet_io.core.exceptions import (
     BatchTooLargeError,
     GeoParquetError,
@@ -47,7 +47,6 @@ from geoparquet_io.core.http_retry import (
     make_request_with_retry,
 )
 from geoparquet_io.core.logging_config import configure_verbose, debug, progress, success, warn
-from geoparquet_io.core.remote import setup_aws_profile_if_needed
 from geoparquet_io.core.write_funnels import write_geoparquet_table
 
 # ArcGIS Online token endpoint
@@ -214,6 +213,58 @@ def _batch_ladder_exhausted(offset: int, reason: str) -> GeoParquetError:
         "them server-side, or --timeout for a slow server - or the service itself is "
         "failing; retry later."
     )
+
+
+# What a layer's metadata means when it says nothing about its page size.
+ABSENT_MAX_RECORD_COUNT = 1000
+
+
+def _server_int(value: object) -> int | None:
+    """A whole number a server sent as an int, an integral float or a digit string.
+
+    None for anything else, booleans included (``True`` is an ``int`` in Python
+    but never a count).
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _checked_max_record_count(data: dict) -> int:
+    """The layer's ``maxRecordCount``, or a safe page size when it is unusable (#1053)."""
+    if "maxRecordCount" not in data:
+        return ABSENT_MAX_RECORD_COUNT
+    raw = data["maxRecordCount"]
+    value = _server_int(raw)
+    if value is None or value <= 0:
+        warn(
+            f"Layer advertises an unusable maxRecordCount ({raw!r}), "
+            f"using a page size of {DEFAULT_PAGE_SIZE}"
+        )
+        return DEFAULT_PAGE_SIZE
+    return value
+
+
+def _checked_feature_count(data: dict, query_url: str) -> int:
+    """The ``count`` of a returnCountOnly reply, refused when it is not a count (#1053)."""
+    if "count" not in data:
+        return 0
+    raw = data["count"]
+    value = _server_int(raw)
+    if value is None or value < 0:
+        raise RemoteAccessError(
+            query_url, f"Server returned an invalid feature count: count={raw!r}"
+        )
+    return value
 
 
 def _get_reduced_batch_size(current_batch: int) -> int | None:
@@ -522,7 +573,7 @@ def get_layer_info(
         geometry_type=data.get("geometryType", "esriGeometryPoint"),
         spatial_reference=spatial_reference,
         fields=data.get("fields", []),
-        max_record_count=data.get("maxRecordCount", 1000),
+        max_record_count=_checked_max_record_count(data),
         total_count=count,
     )
 
@@ -569,7 +620,7 @@ def get_feature_count(
     data = _make_request("GET", query_url, params=params, timeout=timeout)
     data = _handle_arcgis_response(data, "Feature count")
 
-    count = data.get("count", 0)
+    count = _checked_feature_count(data, query_url)
     if verbose:
         debug(f"Total feature count: {count}")
 
@@ -1791,6 +1842,7 @@ def arcgis_to_table(
                 debug(f"Could not remove temp file {temp_parquet}")
 
 
+@uses_aws_profile
 def convert_arcgis_to_geoparquet(
     service_url: str,
     output_file: str,
@@ -1865,9 +1917,6 @@ def convert_arcgis_to_geoparquet(
             serialize.
     """
     configure_verbose(verbose)
-
-    # Setup AWS profile if needed
-    setup_aws_profile_if_needed(profile, output_file)
 
     # Check if output file exists and overwrite is False
     if not overwrite and Path(output_file).exists():

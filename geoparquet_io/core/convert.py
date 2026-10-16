@@ -33,6 +33,7 @@ from geoparquet_io.core.duckdb_utils import (
     get_duckdb_connection,
     quote_identifier,
     sql_path,
+    uses_aws_profile,
 )
 from geoparquet_io.core.exceptions import (
     GeometryError,
@@ -49,6 +50,7 @@ from geoparquet_io.core.geo_metadata import (
     build_bbox_covering,
     sanitize_geo_metadata,
 )
+from geoparquet_io.core.geojson_datetimes import DatetimeRead, plan_datetime_read
 from geoparquet_io.core.geometry_detection import (
     STANDARD_GEOMETRY_NAMES,
     detect_parquet_geometry_column,
@@ -63,7 +65,6 @@ from geoparquet_io.core.remote import (
     get_remote_error_hint,
     is_remote_url,
     needs_httpfs,
-    setup_aws_profile_if_needed,
     show_remote_read_message,
     validate_profile_for_urls,
 )
@@ -77,7 +78,11 @@ from geoparquet_io.core.source_text import (
     text_error,
     text_safe_expr,
 )
-from geoparquet_io.core.write_funnels import read_preserved_kv_metadata, write_parquet_with_metadata
+from geoparquet_io.core.write_funnels import (
+    collect_nonplanar_edges,
+    read_preserved_kv_metadata,
+    write_parquet_with_metadata,
+)
 
 
 def _validate_layer_name(layer: str) -> str:
@@ -760,6 +765,23 @@ def _is_geojson_file(input_file):
     path = input_file.split("?")[0]
     ext = os.path.splitext(path)[1].lower()
     return ext in [".geojson", ".json"]
+
+
+def _plan_dates(input_file, open_options, columns) -> DatetimeRead:
+    """Read a GeoJSON source's dates as text for DuckDB to parse (#1152).
+
+    ``columns`` is the detection bind, so planning costs no extra read.
+    """
+    return plan_datetime_read(_is_geojson_file(input_file), open_options, columns)
+
+
+def _dated_st_read_expr(input_file, layer, dates: DatetimeRead, column_aliases=None) -> str:
+    """``ST_Read`` with ``dates``' open options, its text dates cast back."""
+    return dates.wrap(
+        _build_st_read_expr(
+            input_file, layer, open_options=dates.open_options, column_aliases=column_aliases
+        )
+    )
 
 
 # Default max line size for CSV reading: 50MB
@@ -2174,6 +2196,7 @@ def _convert_spatial_path(
     # Use multi-geometry detection for parquet files
     column_aliases = None
     source_columns = None
+    dates = DatetimeRead(open_options)
     if is_parquet:
         geom_info = (
             parquet_geometry
@@ -2187,6 +2210,7 @@ def _convert_spatial_path(
         geom_column, column_aliases = _detect_spatial_geometry(
             con, input_file, verbose, layer, open_options, columns_out=source_columns
         )
+        dates = _plan_dates(input_file, open_options, source_columns)
         secondary_columns = []
         geom_info = {
             "primary": geom_column,
@@ -2217,10 +2241,8 @@ def _convert_spatial_path(
                 con, input_file, layer, geom_column, max_angle_deg, open_options=open_options
             )
             linearized = True
-        elif open_options or column_aliases:
-            table_expr = _build_st_read_expr(
-                input_file, layer, open_options=open_options, column_aliases=column_aliases
-            )
+        elif open_options or column_aliases or dates.casts:
+            table_expr = _dated_st_read_expr(input_file, layer, dates, column_aliases)
 
     if force_2d:
         if is_parquet:
@@ -2337,6 +2359,23 @@ def _convert_spatial_path(
     return query, geom_info, bbox_covering_column, order_by
 
 
+def _carry_input_kv_metadata(arrow_table, input_file: str, verbose: bool):
+    """Put a Parquet source's non-geo KV keys on the table its query built (#1268).
+
+    The DuckDB query hands back no schema metadata, so without this
+    ``gpio.convert(path).write(out)`` kept only the regenerated ``geo`` key.
+    Which keys survive is :func:`extract_preserved_kv_metadata`'s rule, the one
+    every other write path uses (#690). A key the table already has wins.
+    """
+    preserved = read_preserved_kv_metadata(input_file, verbose=verbose)
+    if not preserved:
+        return arrow_table
+    metadata = {k.encode("utf-8"): v.encode("utf-8") for k, v in preserved.items()}
+    metadata.update(arrow_table.schema.metadata or {})
+    return arrow_table.replace_schema_metadata(metadata)
+
+
+@uses_aws_profile
 def read_spatial_to_arrow(
     input_file,
     *,
@@ -2410,9 +2449,6 @@ def read_spatial_to_arrow(
 
     # Validate profile is only used with S3
     validate_profile_for_urls(profile, input_file)
-
-    # Setup AWS profile if needed
-    setup_aws_profile_if_needed(profile, input_file)
 
     # Show progress for remote files
     show_remote_read_message(input_file, verbose=False)
@@ -2553,19 +2589,33 @@ def read_spatial_to_arrow(
                 # Spatial formats (GeoJSON, Shapefile, GeoPackage, etc.)
                 table_expr = _plain_st_read_expr(input_file, encoding, layer, con=con)
             arrow_table = con.execute(f"SELECT * FROM {table_expr}").arrow().read_all()
+            if is_parquet:
+                arrow_table = _carry_input_kv_metadata(arrow_table, input_file, verbose)
             return arrow_table, None, None
 
         # Repair invalid geometry (issue #506). The geometry column is WKB-encoded
-        # at this point; the helper preserves schema metadata.
+        # at this point; the helper preserves schema metadata. A Parquet input
+        # can declare non-planar edges (geo block or GEOGRAPHY logical type),
+        # which skips the planar repair (#1287) — the read renamed the column to
+        # "geometry", so look the declaration up under the input's own name.
+        input_edges = None
+        if is_parquet:
+            edges_by_col = collect_nonplanar_edges(input_file)
+            input_edges = edges_by_col.get(parquet_geom_column or geometry_column)
         if arrow_table.num_rows > 0:
             arrow_table, _ = repair_arrow_table_geometry(
-                arrow_table, geometry_column, repair=repair_geometry
+                arrow_table, geometry_column, repair=repair_geometry, nonplanar_edges=input_edges
             )
 
         # The query hands back bare WKB with no schema metadata. Say which column
-        # is the geometry and what CRS it is in, so every Table method that passes
-        # the Arrow table down to core sees what a read() table shows (#1222).
-        arrow_table = describe_wkb_geometry(arrow_table, geometry_column, detected_crs)
+        # is the geometry, what CRS it is in and which edges it declares, so every
+        # Table method that passes the Arrow table down to core sees what a
+        # read() table shows (#1222) and the write keeps spherical edges (#1287).
+        arrow_table = describe_wkb_geometry(
+            arrow_table, geometry_column, detected_crs, edges=input_edges
+        )
+        if is_parquet:
+            arrow_table = _carry_input_kv_metadata(arrow_table, input_file, verbose)
         return arrow_table, detected_crs, geometry_column
 
     except duckdb.IOException as e:
@@ -2759,13 +2809,9 @@ def _read_spatial_to_arrow(
                 open_options=open_options,
                 force_2d=force_2d,
             )
+        dates = _plan_dates(input_file, open_options, columns)
         table_expr = text_safe_expr(
-            con,
-            _build_st_read_expr(
-                input_file, layer, open_options=open_options, column_aliases=column_aliases
-            ),
-            text,
-            columns,
+            con, _dated_st_read_expr(input_file, layer, dates, column_aliases), text, columns
         )
 
     # Convert geometry to WKB for geoarrow compatibility
@@ -3114,6 +3160,7 @@ def _report_conversion_results(output_file: str, start_time: float, is_geo: bool
         )
 
 
+@uses_aws_profile
 def convert_to_geoparquet(
     input_file,
     output_file,
@@ -3205,7 +3252,6 @@ def convert_to_geoparquet(
     start_time = time.time()
 
     validate_profile_for_urls(profile, input_file, output_file)
-    setup_aws_profile_if_needed(profile, input_file, output_file)
     show_remote_read_message(input_file, verbose=False)
     input_url = resolve_file_url(input_file, verbose)
     validate_output_path(output_file, verbose)
@@ -3368,7 +3414,15 @@ def convert_to_geoparquet(
             # computed upstream stays correct.
             if has_geometry:
                 geom_col = geometry_info["primary"]
-                query = repair_query_geometry(con, query, geom_col, repair=repair_geometry)
+                # Only a Parquet input can declare non-planar edges (geo block
+                # or native GEOGRAPHY logical type); that declaration skips the
+                # planar repair, which would corrupt spherical shapes (#1287).
+                input_edges = (
+                    collect_nonplanar_edges(input_file).get(geom_col) if is_parquet else None
+                )
+                query = repair_query_geometry(
+                    con, query, geom_col, repair=repair_geometry, nonplanar_edges=input_edges
+                )
                 # Sort last. The repair count above is a full pass over the
                 # rows, and DuckDB keeps an ORDER BY inside a COUNT subquery:
                 # counting the ordered query sorted the whole input once more,
