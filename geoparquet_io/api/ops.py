@@ -3190,6 +3190,7 @@ def polygonize(
     nodata: float | None = None,
     use_mask: bool = True,
     verbose: bool = False,
+    repair_geometry: bool = True,
 ) -> pa.Table:
     """
     Polygonize a categorical raster band into a GeoParquet-ready table.
@@ -3205,6 +3206,15 @@ def polygonize(
         nodata: Nodata value to exclude (default: the raster's own tag)
         use_mask: Honor the raster's mask/nodata (default: True)
         verbose: Whether to print verbose output
+        repair_geometry: Repair the self-touching rings contourrs emits where a
+            region pinches to one pixel corner -- not OGC-valid, where
+            rasterio's and GDAL's equivalent output is (default: True, as in
+            every command that offers ``--repair-geometry``). Appended last:
+            ops signatures are positional-or-keyword, so inserting it
+            mid-signature would silently re-map existing positional calls.
+            The count is reported either way; the repair itself can cost
+            several times the polygonization, because the self-touching
+            polygons are the large sprawling regions.
 
     Returns:
         PyArrow Table with one feature per contiguous class region
@@ -3218,6 +3228,7 @@ def polygonize(
         value_column=value_column,
         nodata=nodata,
         use_mask=use_mask,
+        repair_geometry=repair_geometry,
         verbose=verbose,
     )
 
